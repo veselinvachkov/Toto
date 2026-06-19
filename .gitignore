@@ -1,0 +1,19 @@
+# Secrets — NEVER commit
+.env
+*.key
+
+# Foundry build artifacts & dependencies
+out/
+cache/
+broadcast/
+lib/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+node_modules/
+
+# Editor / tooling
+.claude/
+.DS_Store
