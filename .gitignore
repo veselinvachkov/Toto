@@ -2,6 +2,9 @@
 .env
 *.key
 
+# Deploy scripts — kept local, not published
+script/
+
 # Foundry build artifacts & dependencies
 out/
 cache/
