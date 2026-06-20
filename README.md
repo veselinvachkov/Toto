@@ -1,3 +1,7 @@
+# Toto Project
+
+A Bulgarian Toto lottery implemented as Solidity smart contracts, using Chainlink VRF for verifiable random draws. Built and tested with Foundry, with a web frontend under `frontend/`.
+
 ## Foundry
 
 **Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
