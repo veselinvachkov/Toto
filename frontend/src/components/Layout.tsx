@@ -29,7 +29,6 @@ export default function Layout() {
           <li><NavLink to="/buy" className={({ isActive }) => isActive ? 'active' : ''}>Buy Ticket</NavLink></li>
           <li><NavLink to="/my-tickets" className={({ isActive }) => isActive ? 'active' : ''}>My Tickets</NavLink></li>
           <li><NavLink to="/history" className={({ isActive }) => isActive ? 'active' : ''}>History</NavLink></li>
-          <li><NavLink to="/lp" className={({ isActive }) => isActive ? 'active' : ''}>LP Vault</NavLink></li>
           {isOwner && (
             <li><NavLink to="/admin" className={({ isActive }) => isActive ? 'active' : ''}>Admin</NavLink></li>
           )}

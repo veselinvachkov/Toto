@@ -1,12 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTotoRead } from '../hooks/useToto';
 import { readProvider } from '../hooks/useEthers';
-import { DEPLOY_BLOCK } from '../config/contract';
+import { usePolling } from '../hooks/usePolling';
+import { CONTRACT_ADDRESS, DEPLOY_BLOCK } from '../config/contract';
+import { loadCache, saveCache } from '../utils/persist';
 import { fmtUsdc } from '../utils/format';
 
 // Public RPCs cap `eth_getLogs` block ranges (publicnode ~10k). Query the
 // Claimed history in chunks starting from the deploy block instead of genesis.
 const LOG_CHUNK = 9_000;
+
+// The board only ever shows the top 5. We keep a small bounded buffer of the
+// largest distinct wins so the cache CANNOT grow without limit no matter how
+// many claims happen over the protocol's lifetime - the previous "Map of every
+// Claimed event ever" grew unbounded in browser memory.
+const TOP_KEEP = 25;
 
 interface Entry {
   ticketId: string;
@@ -16,116 +24,108 @@ interface Entry {
 
 const SHORT_ADDR = (a: string) => `${a.slice(0, 6)}...${a.slice(-4)}`;
 
-// Top 5 *distinct* wins. Collapse by (owner, amount) so one winner claiming
-// many identical tickets occupies a single slot, while two different players
-// winning the same amount stay as separate entries.
-function topDistinct(all: Iterable<Entry>): Entry[] {
+// Persisted, contract-scoped cache. Keyed by contract address so a redeploy
+// auto-invalidates stale data. Survives reloads: a returning visitor only
+// scans the handful of new blocks since `scannedTo` instead of re-scanning the
+// entire history from the deploy block on every load.
+type LbCache = { top: Entry[]; scannedTo: number };
+const STORAGE_KEY = `toto:lb:${CONTRACT_ADDRESS.toLowerCase()}`;
+
+const cache: LbCache = (() => {
+  const c = loadCache<LbCache>(STORAGE_KEY, { top: [], scannedTo: DEPLOY_BLOCK - 1 });
+  if (!Array.isArray(c.top) || typeof c.scannedTo !== 'number') {
+    return { top: [], scannedTo: DEPLOY_BLOCK - 1 };
+  }
+  return c;
+})();
+let inflight: Promise<void> | null = null;
+
+// Collapse by (owner, amount) so one winner who claims many identical tickets
+// fills a single slot, then keep only the largest TOP_KEEP. Bounded by design.
+function mergeTop(existing: Entry[], incoming: Entry[]): Entry[] {
   const distinct = new Map<string, Entry>();
-  for (const e of all) {
+  for (const e of [...existing, ...incoming]) {
     const key = `${e.owner.toLowerCase()}|${e.amount}`;
     if (!distinct.has(key)) distinct.set(key, e);
   }
-  return [...distinct.values()].sort((a, b) => b.amount - a.amount).slice(0, 5);
+  return [...distinct.values()].sort((a, b) => b.amount - a.amount).slice(0, TOP_KEEP);
 }
-
-// Module-level cache shared across remounts and the 30s refreshes. History is
-// scanned from DEPLOY_BLOCK once; later loads only query blocks since `scannedTo`.
-const logCache: { byTicket: Map<string, Entry>; scannedTo: number } = {
-  byTicket: new Map(),
-  scannedTo: DEPLOY_BLOCK - 1,
-};
-let inflight: Promise<void> | null = null;
 
 export default function Leaderboard() {
   const toto = useTotoRead();
-  const [entries, setEntries] = useState<Entry[]>(() =>
-    topDistinct(logCache.byTicket.values()),
-  );
-  const [loading, setLoading] = useState(logCache.byTicket.size === 0);
+  const [entries, setEntries] = useState<Entry[]>(() => cache.top.slice(0, 5));
+  const [loading, setLoading] = useState(cache.top.length === 0);
+  const mounted = useRef(true);
 
   useEffect(() => {
-    let cancelled = false;
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
+  const load = async () => {
     const publish = () => {
-      if (!cancelled) {
-        setEntries(topDistinct(logCache.byTicket.values()));
+      if (mounted.current) {
+        setEntries(cache.top.slice(0, 5));
         setLoading(false);
       }
     };
 
-    const ingest = (logs: any[]) => {
-      for (const log of logs) {
-        logCache.byTicket.set(log.args[0].toString(), {
-          ticketId: log.args[0].toString(),
-          owner: log.args[1] as string,
-          amount: Number(log.args[2]) / 1e6,
-        });
-      }
-    };
+    // Coalesce concurrent loads (mount + interval) into one scan.
+    if (inflight) { await inflight; publish(); return; }
 
-    // Scan [from, to] as parallel chunks with bounded concurrency. Each window
-    // that returns publishes immediately, so the board fills in progressively
-    // instead of blocking on the entire history (the old sequential loop did
-    // one round-trip per 9k blocks before showing anything). `scannedTo` only
-    // advances across the leading run of successful chunks, so a failed window
-    // is retried on the next refresh rather than skipped.
-    const scanRange = async (from: number, to: number) => {
-      const filter = toto.filters.Claimed();
-      const chunks: Array<{ f: number; t: number }> = [];
-      for (let f = from; f <= to; f += LOG_CHUNK + 1) {
-        chunks.push({ f, t: Math.min(f + LOG_CHUNK, to) });
-      }
+    inflight = (async () => {
+      try {
+        const latest = await readProvider.getBlockNumber();
+        if (latest <= cache.scannedTo) return;
 
-      const CONCURRENCY = 6;
-      const ok = new Array<boolean>(chunks.length).fill(false);
-      let next = 0;
-
-      const worker = async () => {
-        while (!cancelled) {
-          const i = next++;
-          if (i >= chunks.length) return;
-          try {
-            const logs = await toto.queryFilter(filter, chunks[i].f, chunks[i].t);
-            ingest(logs as any[]);
-            ok[i] = true;
-            publish(); // progressive update as each window returns
-          } catch { /* leave ok[i] false → retried on next refresh */ }
+        const from = cache.scannedTo + 1;
+        const filter = toto.filters.Claimed();
+        const windows: Array<{ f: number; t: number }> = [];
+        for (let f = from; f <= latest; f += LOG_CHUNK + 1) {
+          windows.push({ f, t: Math.min(f + LOG_CHUNK, latest) });
         }
-      };
 
-      await Promise.all(
-        Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker),
-      );
+        // Bounded-concurrency parallel scan; each window publishes as it returns
+        // so the board fills progressively instead of blocking on the whole
+        // history. `scannedTo` only advances across the leading run of OK
+        // windows, so a failed window is retried on the next refresh.
+        const CONCURRENCY = 6;
+        const ok = new Array<boolean>(windows.length).fill(false);
+        let next = 0;
+        const worker = async () => {
+          while (mounted.current) {
+            const i = next++;
+            if (i >= windows.length) return;
+            try {
+              const logs = await toto.queryFilter(filter, windows[i].f, windows[i].t);
+              const fresh: Entry[] = (logs as any[]).map((log) => ({
+                ticketId: log.args[0].toString(),
+                owner: log.args[1] as string,
+                amount: Number(log.args[2]) / 1e6,
+              }));
+              cache.top = mergeTop(cache.top, fresh);
+              ok[i] = true;
+              publish();
+            } catch { /* leave ok[i] false -> retried on next refresh */ }
+          }
+        };
+        await Promise.all(
+          Array.from({ length: Math.min(CONCURRENCY, windows.length) }, worker),
+        );
 
-      // Advance scannedTo across the leading contiguous run of OK chunks only.
-      let prefix = 0;
-      while (prefix < chunks.length && ok[prefix]) prefix++;
-      if (prefix > 0) logCache.scannedTo = chunks[prefix - 1].t;
-    };
+        let prefix = 0;
+        while (prefix < windows.length && ok[prefix]) prefix++;
+        if (prefix > 0) cache.scannedTo = windows[prefix - 1].t;
+        saveCache(STORAGE_KEY, cache);
+      } catch { /* keep previously loaded entries */ }
+    })();
 
-    const load = async () => {
-      // Coalesce concurrent loads (mount + interval) into one scan.
-      if (inflight) { await inflight; }
-      else {
-        inflight = (async () => {
-          try {
-            const latest = await readProvider.getBlockNumber();
-            if (latest > logCache.scannedTo) {
-              await scanRange(logCache.scannedTo + 1, latest);
-            }
-          } catch { /* keep previously loaded entries */ }
-        })();
-        try { await inflight; } finally { inflight = null; }
-      }
+    try { await inflight; } finally { inflight = null; }
+    publish();
+  };
 
-      publish();
-    };
-
-    load();
-    // Refresh so new wins show up without a manual reload.
-    const id = setInterval(load, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [toto]);
+  // Refreshes only while the tab is visible (see usePolling).
+  usePolling(() => { load(); }, 30_000);
 
   return (
     <aside className="leaderboard card">

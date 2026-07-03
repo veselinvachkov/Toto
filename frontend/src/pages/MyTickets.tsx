@@ -3,11 +3,13 @@ import { formatUnits } from 'ethers';
 import { useAccount } from 'wagmi';
 import { useTotoRead, useTotoWrite } from '../hooks/useToto';
 import { readProvider } from '../hooks/useEthers';
-import { DEPLOY_BLOCK } from '../config/contract';
+import { CONTRACT_ADDRESS, DEPLOY_BLOCK } from '../config/contract';
 import { multicall } from '../hooks/multicall';
 import { formatError } from '../utils/errors';
 import { fmtUsdc } from '../utils/format';
+import { loadCache, saveCache } from '../utils/persist';
 import LotteryBall from '../components/LotteryBall';
+import { drawWinCard, canvasToBlob, type WinCardData } from '../utils/winCard';
 
 const STATE_LABELS = ['Open', 'Drawing', 'Tallying', 'Claimable', 'Expired'];
 const STATE_BADGE  = ['badge-open', 'badge-awaiting', 'badge-tallying', 'badge-claimable', 'badge-expired'];
@@ -35,6 +37,30 @@ interface RoundDetail {
   loading: boolean;
   loaded: boolean;
   wins: Record<number, WinInfo>;
+}
+
+/** Per-wallet persisted Claimed-event payouts + how far we've scanned. */
+interface ClaimsCache {
+  amounts: Record<number, string>;
+  scannedTo: number;
+}
+
+function TrophyIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+      style={{ verticalAlign: '-2px', marginRight: 6 }}
+      aria-hidden="true"
+    >
+      <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6" />
+      <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18" />
+      <path d="M4 22h16" />
+      <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22" />
+      <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22" />
+      <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z" />
+    </svg>
+  );
 }
 
 function maskToNumbers(mask: bigint, max: number): number[] {
@@ -72,6 +98,26 @@ const ticketCache: {
   claimedAmounts: Record<number, string>;
 } = { base: [], roundStates: {}, details: {}, claimedAmounts: {} };
 
+// Cap the per-round detail cache so a multi-year power user can't accumulate
+// detail for unbounded rounds. It must comfortably exceed the window in which a
+// user can still hold relevant (claimable, unexpired) tickets, otherwise
+// re-entering this page would re-fetch winner detail for in-window rounds on
+// every visit. A ticket is claimable for EXPIRY_PERIOD (365 days) and a round
+// runs every drawInterval (3 days by default, admin-adjustable) => ~122 rounds/year
+// at the default cadence. We keep 366 (~3 years of rounds at the default) so the
+// entire claimable window always stays cached, with margin.
+// Each entry is tiny (a few tickets), so this is still a trivial memory bound.
+// Numeric keys sort ascending in JS, so we keep the newest ids and drop oldest.
+const DETAILS_CAP = 200;
+function capDetails(d: Record<number, RoundDetail>): Record<number, RoundDetail> {
+  const keys = Object.keys(d).map(Number);
+  if (keys.length <= DETAILS_CAP) return d;
+  const keep = keys.sort((a, b) => b - a).slice(0, DETAILS_CAP);
+  const out: Record<number, RoundDetail> = {};
+  for (const k of keep) out[k] = d[k];
+  return out;
+}
+
 export default function MyTickets() {
   const { address } = useAccount();
   const toto = useTotoRead();
@@ -98,6 +144,10 @@ export default function MyTickets() {
   // Transfer modal
   const [transferId, setTransferId] = useState<number | null>(null);
   const [transferTo, setTransferTo] = useState('');
+
+  // Win-card share modal
+  const [winCard, setWinCard] = useState<WinCardData | null>(null);
+  const [winCardUrl, setWinCardUrl] = useState<string | null>(null);
 
   /** Fetch the cheap per-ticket data + each round's state. No winner lookups.
    *  Returns the freshly loaded list so callers can act on it without waiting
@@ -157,37 +207,60 @@ export default function MyTickets() {
 
   /** Resolve the payout of every ticket this wallet has CLAIMED. previewClaim()
    *  returns 0 after a claim, so the amount only survives in the Claimed event
-   *  (indexed by owner). Scanned in parallel chunks from the deploy block. */
+   *  (indexed by owner). Persisted per wallet in localStorage so each visit only
+   *  scans the new blocks since last time instead of the whole history. */
   const fetchClaimedAmounts = useCallback(async () => {
     if (!address) return;
+    const key = `toto:claims:${CONTRACT_ADDRESS.toLowerCase()}:${address.toLowerCase()}`;
+    const persisted = loadCache<ClaimsCache>(key, { amounts: {}, scannedTo: DEPLOY_BLOCK - 1 });
+    const amounts: Record<number, string> = { ...persisted.amounts };
+    // Show persisted payouts instantly; the incremental scan below only covers
+    // new blocks.
+    if (Object.keys(amounts).length > 0) setClaimedAmounts(amounts);
     try {
       const filter = toto.filters.Claimed(undefined, address);
       const latest = await readProvider.getBlockNumber();
-      const chunks: Array<{ f: number; t: number }> = [];
-      for (let f = DEPLOY_BLOCK; f <= latest; f += LOG_CHUNK + 1) {
-        chunks.push({ f, t: Math.min(f + LOG_CHUNK, latest) });
+      const from = Math.max(DEPLOY_BLOCK, persisted.scannedTo + 1);
+
+      const windows: Array<{ f: number; t: number }> = [];
+      for (let f = from; f <= latest; f += LOG_CHUNK + 1) {
+        windows.push({ f, t: Math.min(f + LOG_CHUNK, latest) });
       }
-      const amounts: Record<number, string> = {};
+      const ok = new Array<boolean>(windows.length).fill(false);
       const CONCURRENCY = 6;
       let next = 0;
       const worker = async () => {
         for (;;) {
           const i = next++;
-          if (i >= chunks.length) return;
+          if (i >= windows.length) return;
           try {
-            const logs = await toto.queryFilter(filter, chunks[i].f, chunks[i].t);
+            const logs = await toto.queryFilter(filter, windows[i].f, windows[i].t);
             for (const log of logs as any[]) {
               amounts[Number(log.args[0])] = formatUnits(log.args[2], 6);
             }
-          } catch { /* skip window, keep what we have */ }
+            ok[i] = true;
+          } catch { /* skip window, keep what we have -> retried next time */ }
         }
       };
       await Promise.all(
-        Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker),
+        Array.from({ length: Math.min(CONCURRENCY, windows.length) }, worker),
       );
+
+      // Persist progress only across the leading run of OK windows so a failed
+      // window is re-scanned next visit rather than silently skipped.
+      let scannedTo = persisted.scannedTo;
+      let prefix = 0;
+      while (prefix < windows.length && ok[prefix]) prefix++;
+      if (prefix > 0) scannedTo = windows[prefix - 1].t;
+      saveCache(key, { amounts, scannedTo });
+
       setClaimedAmounts(amounts);
       ticketCache.claimedAmounts = amounts;
-    } catch { /* keep previous amounts */ }
+    } catch {
+      // Network failure: still surface anything we had persisted.
+      setClaimedAmounts(amounts);
+      ticketCache.claimedAmounts = amounts;
+    }
   }, [address, toto]);
 
   useEffect(() => { fetchClaimedAmounts(); }, [fetchClaimedAmounts]);
@@ -217,7 +290,7 @@ export default function MyTickets() {
     });
     const done: RoundDetail = { loading: false, loaded: true, wins };
     setDetails((d) => ({ ...d, [roundId]: done }));
-    ticketCache.details = { ...ticketCache.details, [roundId]: done };
+    ticketCache.details = capDetails({ ...ticketCache.details, [roundId]: done });
   }, [baseTickets, toto]);
 
   // Eagerly resolve winner info for rounds in the "Claimable" state so the
@@ -295,6 +368,59 @@ export default function MyTickets() {
     } finally {
       setBusy(null);
     }
+  };
+
+  // Build + preview the shareable win card for a ticket.
+  const openWinCard = (data: WinCardData) => {
+    const canvas = drawWinCard(data);
+    setWinCard(data);
+    setWinCardUrl(canvas.toDataURL('image/png'));
+  };
+
+  const closeWinCard = () => {
+    setWinCard(null);
+    setWinCardUrl(null);
+  };
+
+  const winCardFileName = (d: WinCardData) =>
+    `toto-win-ticket-${d.ticketId}.png`;
+
+  const downloadWinCard = () => {
+    if (!winCard || !winCardUrl) return;
+    const a = document.createElement('a');
+    a.href = winCardUrl;
+    a.download = winCardFileName(winCard);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const winCardTweetText = (d: WinCardData) =>
+    `I just won ${fmtUsdc(d.payout)} USDC on TOTO playing ${d.game === 0 ? '5/35' : '6/49'}! #TOTO #OnchainLottery`;
+
+  const shareWinCardOnX = async () => {
+    if (!winCard) return;
+    const text = winCardTweetText(winCard);
+    // Prefer the native share sheet with the image attached (mobile / supported
+    // browsers); fall back to downloading the image + opening the X composer.
+    try {
+      const canvas = drawWinCard(winCard);
+      const blob = await canvasToBlob(canvas);
+      const file = new File([blob], winCardFileName(winCard), { type: 'image/png' });
+      const nav = navigator as Navigator & { canShare?: (d: any) => boolean };
+      if (nav.canShare && nav.canShare({ files: [file] })) {
+        await nav.share({ files: [file], text });
+        return;
+      }
+    } catch { /* fall through to intent */ }
+    // X web intent can't accept an uploaded image, so save it locally first and
+    // let the user attach it in the composer.
+    downloadWinCard();
+    window.open(
+      `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`,
+      '_blank',
+      'noopener',
+    );
   };
 
   if (!address) {
@@ -382,6 +508,13 @@ export default function MyTickets() {
                   const roundOpen = rState === 0;
                   const canRefund = roundOpen && !t.claimed && !t.refunded && !win?.isWinner;
                   const canTransfer = roundOpen && !t.claimed && !t.refunded;
+                  // A ticket is "won" if it is a current winner awaiting claim, or
+                  // was already claimed (claim only succeeds for winners) and we
+                  // know its payout from the Claimed event.
+                  const wonPayout = win?.isWinner
+                    ? win.payout
+                    : (t.claimed && claimedAmounts[t.id] != null ? claimedAmounts[t.id] : null);
+                  const isWon = wonPayout != null;
 
                   return (
                     <div className="ticket-card" key={t.id}>
@@ -413,6 +546,20 @@ export default function MyTickets() {
                             {busy === t.id ? '...' : 'Claim'}
                           </button>
                         )}
+                        {isWon && (
+                          <button
+                            className="btn btn-outline btn-sm"
+                            onClick={() => openWinCard({
+                              ticketId: t.id,
+                              roundId,
+                              game: t.game,
+                              numbers: nums,
+                              payout: wonPayout!,
+                            })}
+                          >
+                            <TrophyIcon />Share Win
+                          </button>
+                        )}
                         {canRefund && (
                           <button className="btn btn-outline btn-sm" disabled={busy !== null} onClick={() => handleRefund(t.id)}>
                             Refund
@@ -432,6 +579,25 @@ export default function MyTickets() {
           </div>
         );
       })}
+
+      {/* Win-card share modal */}
+      {winCard && winCardUrl && (
+        <div className="modal-overlay" onClick={closeWinCard}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <h3><TrophyIcon size={20} />Share your win</h3>
+            <img
+              src={winCardUrl}
+              alt={`Winning ticket #${winCard.ticketId}`}
+              style={{ width: '100%', borderRadius: 12, display: 'block', margin: '12px 0' }}
+            />
+            <div className="modal-actions">
+              <button className="btn btn-outline" onClick={closeWinCard}>Close</button>
+              <button className="btn btn-outline" onClick={downloadWinCard}>Download</button>
+              <button className="btn btn-primary" onClick={shareWinCardOnX}>Share on X</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Transfer modal */}
       {transferId !== null && (

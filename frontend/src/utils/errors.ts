@@ -1,9 +1,9 @@
-/// Decodes ethers v6 transaction errors into friendly messages for known
-/// custom errors (lottery, USDC, OpenZeppelin, Chainlink VRF) instead of
-/// raw 4-byte selectors.
+/// Best-effort decoder for ethers v6 transaction errors. Surfaces friendly,
+/// human-readable messages for known custom errors (lottery contract, USDC,
+/// OpenZeppelin libs, Chainlink VRF) instead of raw 4-byte selectors.
 
-/// 4-byte selector → user-facing message. Selectors are lowercase
-/// keccak256(signature)[:4].
+/// Map of 4-byte selectors → user-facing messages.
+/// All selectors are lowercase. Computed via keccak256(signature)[:4].
 const SELECTOR_MESSAGES: Record<string, string> = {
   // ── BulgarianToto custom errors ─────────────────────────────────────────
   '0x57e25a09': 'Invalid game ID. Choose 5/35 or 6/49.',
@@ -21,14 +21,6 @@ const SELECTOR_MESSAGES: Record<string, string> = {
   '0xcbca5aa2': 'The amount must be greater than zero.',
   '0xc867df3a': 'The prize pool would have a negative balance.',
   '0x406cb379': 'The first draw time is too soon. It must be in the future.',
-  '0x4e0141b1': 'The LP deposit amount must be greater than zero.',
-  '0xb0678679': 'The pool is below the minimum threshold for LPs.',
-  '0xf5072f1d': 'You have no LP shares to withdraw.',
-  '0x6fa5be9e': 'The LP tranche is still locked.',
-  '0xc8fea096': 'Invalid LP tranche.',
-  '0x39996567': 'Insufficient LP shares.',
-  '0x8313ea3c': 'The previous round has not been finalized yet.',
-  '0xbb55fd27': 'Insufficient liquidity in the pool.',
 
   // ── ERC20 (OpenZeppelin v5) ─────────────────────────────────────────────
   '0xfb8f41b2': 'USDC approval is required. Approve the contract to spend your USDC and try again.',
@@ -93,7 +85,8 @@ export function formatError(e: any): string {
   const revertName = e?.revert?.name;
   if (revertName) {
     const args = e?.revert?.args;
-    // Map common decoded errors to friendly strings.
+    // Map a few common decoded errors to friendly strings even when ethers
+    // already decoded them.
     const byName: Record<string, string> = {
       ERC20InsufficientAllowance: SELECTOR_MESSAGES['0xfb8f41b2'],
       ERC20InsufficientBalance: SELECTOR_MESSAGES['0xe450d38c'],

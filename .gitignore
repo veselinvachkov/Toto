@@ -1,22 +1,54 @@
-# Secrets — NEVER commit
+# ───────────────────────── SECRETS — NEVER COMMIT ─────────────────────────
+# Plaintext keys / RPC / API keys live here. Keep ONLY .env.example tracked.
 .env
+.env.*
+!.env.example
 *.key
+*.pem
+keystore/
+*.keystore
+mnemonic*
 
-# Deploy scripts — kept local, not published
-script/
-
-# Foundry build artifacts & dependencies
+# ───────────────────────── Foundry / Solidity ─────────────────────────
 out/
 cache/
+# broadcast/ contains deployment tx data (addresses, args) — keep private.
+# NOTE: comments MUST be on their own line; a trailing "# ..." would become
+# part of the pattern and silently disable it.
 broadcast/
+.gas-snapshot
+# Dependencies — install with `forge install`, not tracked in the repo.
 lib/
+# Deploy scripts — kept local, not published.
+script/
 
-# Node / frontend
-frontend/node_modules/
-frontend/dist/
-frontend/tsconfig.tsbuildinfo
+# ───────────────────────── Private / security ─────────────────────────
+# Unfixed vulnerability write-ups — must not be published while live.
+BulgarianToto-findings.md
+
+# ───────────────────────── Frontend (Node / Vite) ─────────────────────────
 node_modules/
+frontend/node_modules/
+# build artifact — regenerate with `npm run build`
+frontend/dist/
+*.tsbuildinfo
+.vite/
 
-# Editor / tooling
-.claude/
+# Local Foundry keystores (if you import a deployer key for `forge --account`)
+*.json.keystore
+.foundry/keystores/
+
+# ───────────────────────── Python venv / misc ─────────────────────────
+.venv/
+__pycache__/
+*.pyc
+
+# ───────────────────────── OS / editor / tooling ─────────────────────────
 .DS_Store
+*.log
+.idea/
+.vscode/
+.claude/
+
+# Editor backup files
+*.bak

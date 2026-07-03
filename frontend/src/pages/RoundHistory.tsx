@@ -32,13 +32,13 @@ interface RoundData {
   id: number;
   drawTime: number;
   expiryTime: number;
-  snapshotPool: string;
+  poolSnapshot: string;
+  stake5: string;
+  stake6: string;
   state: number;
   drawn5: number[];
   drawn6: number[];
   ticketCount: number;
-  lpAssetsAtSnap: string;
-  lpShareOfSnap: number; // 0..1
 }
 
 interface TierData {
@@ -63,6 +63,18 @@ const historyCache: { rounds: RoundData[]; tiers: Record<number, TierBundle> } =
   tiers: {},
 };
 
+// Bound the per-round tier cache so expanding many rounds over a long session
+// can't grow it without limit. Keep the highest (newest) round ids.
+const TIERS_CAP = 30;
+function capTiers(t: Record<number, TierBundle>): Record<number, TierBundle> {
+  const keys = Object.keys(t).map(Number);
+  if (keys.length <= TIERS_CAP) return t;
+  const keep = keys.sort((a, b) => b - a).slice(0, TIERS_CAP);
+  const out: Record<number, TierBundle> = {};
+  for (const k of keep) out[k] = t[k];
+  return out;
+}
+
 export default function RoundHistory() {
   const toto = useTotoRead();
   const [rounds, setRounds] = useState<RoundData[]>(historyCache.rounds);
@@ -78,30 +90,23 @@ export default function RoundHistory() {
       const ids: number[] = [];
       for (let i = current; i >= 0 && i > current - 20; i--) ids.push(i);
 
-      // Fetch getRoundInfo + lpAssetsAtSnap for all 20 rounds in a single
-      // batched eth_call instead of ~40 sequential requests.
-      const calls = ids.flatMap((i) => [
-        { fn: 'getRoundInfo', args: [i] },
-        { fn: 'lpAssetsAtSnap', args: [i] },
-      ]);
+      // Fetch getRoundInfo for all 20 rounds in a single batched eth_call.
+      const calls = ids.map((i) => ({ fn: 'getRoundInfo', args: [i] }));
       const res = await multicall(toto, calls);
 
       const data: RoundData[] = ids.map((i, idx) => {
-        const info = res[idx * 2];
-        const lpAtSnap = res[idx * 2 + 1] ?? 0n;
-        const snapNum = Number(formatUnits(info.snapshotPool, 6));
-        const lpNum = Number(formatUnits(lpAtSnap, 6));
+        const info = res[idx];
         return {
           id: i,
           drawTime: Number(info.drawTime),
           expiryTime: Number(info.expiryTime),
-          snapshotPool: formatUnits(info.snapshotPool, 6),
+          poolSnapshot: formatUnits(info.poolSnapshot, 6),
+          stake5: formatUnits(info.stake5, 6),
+          stake6: formatUnits(info.stake6, 6),
           state: Number(info.state),
           drawn5: info.drawn5.map(Number),
           drawn6: info.drawn6.map(Number),
           ticketCount: Number(info.ticketCount),
-          lpAssetsAtSnap: lpNum.toString(),
-          lpShareOfSnap: snapNum > 0 ? lpNum / snapNum : 0,
         };
       });
       historyCache.rounds = data;
@@ -182,6 +187,7 @@ export default function RoundHistory() {
 
       const bundle: TierBundle = { t5: t5Raw.map(fmt), t6: t6Raw.map(fmt), w5, w6, winnersOk };
       historyCache.tiers[id] = bundle;
+      historyCache.tiers = capTiers(historyCache.tiers);
       // Ignore a slow response if the user collapsed/expanded another round.
       setExpanded((cur) => {
         if (cur === id) setTiers(bundle);
@@ -254,12 +260,11 @@ export default function RoundHistory() {
               )}
               {tiers && !tiersLoading && (
                 <>
-                  {Number(r.lpAssetsAtSnap) > 0 && (
-                    <p className="muted" style={{ fontSize: '0.85rem', marginBottom: 8 }}>
-                      Covered by LPs at snapshot: <strong>{fmtUsdc(r.lpAssetsAtSnap)} USDC</strong>
-                      {' '}({(r.lpShareOfSnap * 100).toFixed(1)}% of the pool) - LPs absorbed this share of the payouts.
-                    </p>
-                  )}
+                  <p className="muted" style={{ fontSize: '0.85rem', marginBottom: 8 }}>
+                    5/35 stakes: <strong>{fmtUsdc(r.stake5)} USDC</strong> &middot;{' '}
+                    6/49 stakes: <strong>{fmtUsdc(r.stake6)} USDC</strong> &middot;{' '}
+                    Jackpot pool at draw: <strong>{fmtUsdc(r.poolSnapshot)} USDC</strong>
+                  </p>
                   <p className="muted" style={{ fontSize: '0.8rem', marginBottom: 4 }}>
                     "Winning tickets" is the number of actual winning tickets in the tier -
                     a single system ticket can win in several tiers.
@@ -274,7 +279,7 @@ export default function RoundHistory() {
                     <tbody>
                       {[3, 4, 5].map((tier, i) => (
                         <tr key={tier}>
-                          <td>Tier {tier}</td>
+                          <td>Tier {tier}{tier === 5 ? ' (Jackpot)' : ''}</td>
                           <td>{tiers.winnersOk ? tiers.w5[i] : '—'}</td>
                           <td>{fmtUsdc(tiers.t5[i].budget)}</td>
                           <td>{fmtUsdc(tiers.t5[i].remaining)}</td>

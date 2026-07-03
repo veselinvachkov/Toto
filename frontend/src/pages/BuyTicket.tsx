@@ -62,6 +62,15 @@ export default function BuyTicket() {
     });
   };
 
+  const quickPick = () => {
+    const pool = Array.from({ length: g.max }, (_, i) => i + 1);
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    setPicks(pool.slice(0, g.minK).sort((a, b) => a - b));
+  };
+
   const switchGame = (id: number) => {
     setGame(id);
     setPicks([]);
@@ -143,9 +152,12 @@ export default function BuyTicket() {
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <span className="muted">{picksLabel()} ({picks.length}/{g.maxK})</span>
-          {picks.length > 0 && (
-            <button className="btn btn-outline btn-sm" onClick={() => setPicks([])}>Clear</button>
-          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-outline btn-sm" onClick={quickPick}>Quick Pick</button>
+            {picks.length > 0 && (
+              <button className="btn btn-outline btn-sm" onClick={() => setPicks([])}>Clear</button>
+            )}
+          </div>
         </div>
 
         <div className="number-grid">

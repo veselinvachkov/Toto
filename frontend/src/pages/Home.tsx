@@ -1,8 +1,10 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { formatUnits, parseUnits } from 'ethers';
 import { useNavigate } from 'react-router-dom';
 import { useAccount } from 'wagmi';
 import { useTotoRead, useTotoWrite, useUsdcRead, useUsdcWrite } from '../hooks/useToto';
+import { readProvider } from '../hooks/useEthers';
+import { usePolling } from '../hooks/usePolling';
 import { multicall } from '../hooks/multicall';
 import { formatError } from '../utils/errors';
 import { fmtUsdc } from '../utils/format';
@@ -22,7 +24,6 @@ export default function Home() {
 
   const [roundId, setRoundId] = useState(0);
   const [pool, setPool] = useState('0');
-  const [lpAssets, setLpAssets] = useState('0');
   const [drawTime, setDrawTime] = useState(0);
   const [state, setState] = useState(0);
   const [countdown, setCountdown] = useState('');
@@ -35,23 +36,35 @@ export default function Home() {
   const [adminMsg, setAdminMsg] = useState<Msg>(null);
   const [pendingDraws, setPendingDraws] = useState(0);
 
+  // Seconds to add to the device clock to get chain time. The countdown is gated
+  // on-chain by `block.timestamp`, so we anchor it to chain time rather than the
+  // user's machine clock — a wrong/ skewed device clock must not make the timer lie.
+  const chainOffsetRef = useRef(0);
+
   const fetchData = useCallback(async () => {
     try {
-      const [rid, ap, tla] = await multicall(toto, [
+      const [rid, ap] = await multicall(toto, [
         { fn: 'currentRoundId' },
-        { fn: 'availablePool' },
-        { fn: 'totalLpAssets' },
+        { fn: 'cumulativePool' },
       ]);
       const ridN = Number(rid);
       setRoundId(ridN);
       setPool(formatUnits(ap ?? 0n, 6));
-      setLpAssets(formatUnits(tla ?? 0n, 6));
+
+      // Re-sync the device→chain clock offset each poll. One extra lightweight call;
+      // keeps the countdown honest even if the user's clock drifts.
+      try {
+        const blk = await readProvider.getBlock('latest');
+        if (blk) {
+          chainOffsetRef.current = Number(blk.timestamp) - Math.floor(Date.now() / 1000);
+        }
+      } catch { /* keep last known offset */ }
 
       // Count past rounds whose draw is not yet complete (state in {Open, AwaitingVRF, Tallying}
       // and drawTime has passed). Bounded to the last 50 rounds, and fetched in a
       // SINGLE batched eth_call (Multicall3) so this 30s poll can never fan out
       // into a ~50-request burst that trips public-RPC rate limits.
-      const now = Math.floor(Date.now() / 1000);
+      const now = Math.floor(Date.now() / 1000) + chainOffsetRef.current;
       const scanFrom = Math.max(0, ridN - 50);
       const roundIds = Array.from({ length: ridN - scanFrom + 1 }, (_, i) => scanFrom + i);
       const infos = await multicall(toto, roundIds.map((r) => ({ fn: 'getRoundInfo', args: [r] })));
@@ -73,12 +86,12 @@ export default function Home() {
     } catch { /* not deployed yet */ }
   }, [toto]);
 
-  useEffect(() => { fetchData(); const id = setInterval(fetchData, 30000); return () => clearInterval(id); }, [fetchData]);
+  usePolling(fetchData, 30000);
 
   useEffect(() => {
     if (drawTime === 0) return;
     const tick = () => {
-      const diff = drawTime - Math.floor(Date.now() / 1000);
+      const diff = drawTime - (Math.floor(Date.now() / 1000) + chainOffsetRef.current);
       if (diff <= 0) { setCountdown('Draw is available!'); return; }
       const h = Math.floor(diff / 3600);
       const m = Math.floor((diff % 3600) / 60);
@@ -152,19 +165,12 @@ export default function Home() {
 
       <div className="pool-row mb-2">
         <div className="card text-center pool-card">
-          <div className="muted mb-1">Round #{roundId}</div>
           <div className="pool-display">{fmtUsdc(pool)} USDC</div>
-          <div className="muted mt-1">Prize pool</div>
+          <div className="jackpot-label">JACKPOT</div>
           <div className="mt-2">
             <span className={`badge ${STATE_BADGE[state]}`}>{STATE_LABELS[state]}</span>
           </div>
           {state === 0 && <div className="countdown mt-2">{countdown}</div>}
-          <div className="muted mt-2" style={{ fontSize: '0.85rem' }}>
-            Owed to LPs: <strong>{fmtUsdc(lpAssets)} USDC</strong>
-            {Number(pool) > Number(lpAssets) && (
-              <> &middot; House surplus: <strong>{fmtUsdc(Number(pool) - Number(lpAssets))} USDC</strong></>
-            )}
-          </div>
         </div>
         <Leaderboard />
       </div>
@@ -176,11 +182,11 @@ export default function Home() {
             {[7, 14, 21, 28, 35].map(n => <LotteryBall key={n} number={n} size="sm" />)}
           </div>
           <div className="tiers">
-            <div>5 matched: 15% of the pool</div>
-            <div>4 matched: 1% of the pool</div>
-            <div>3 matched: 0.2% of the pool</div>
+            <div>5 matched: 10% of the jackpot pool (Jackpot)</div>
+            <div>4 matched: 19.5% of 5/35 ticket sales</div>
+            <div>3 matched: 30.5% of 5/35 ticket sales</div>
           </div>
-          <div className="muted mb-1" style={{ fontSize: '0.85rem' }}>From 3 USDC</div>
+          <div className="muted mb-1" style={{ fontSize: '0.85rem' }}>From 1.5 USDC</div>
           <button className="btn btn-primary" onClick={() => navigate('/buy?game=0')}>Play 5/35</button>
         </div>
 
@@ -190,12 +196,12 @@ export default function Home() {
             {[8, 16, 25, 33, 41, 49].map(n => <LotteryBall key={n} number={n} size="sm" />)}
           </div>
           <div className="tiers">
-            <div>6 matched: 55% of the pool (Jackpot)</div>
-            <div>5 matched: 3% of the pool</div>
-            <div>4 matched: 2% of the pool</div>
-            <div>3 matched: 0.5% of the pool</div>
+            <div>6 matched: 60% of the jackpot pool (Jackpot)</div>
+            <div>5 matched: 11.25% of 6/49 ticket sales</div>
+            <div>4 matched: 12.5% of 6/49 ticket sales</div>
+            <div>3 matched: 26.25% of 6/49 ticket sales</div>
           </div>
-          <div className="muted mb-1" style={{ fontSize: '0.85rem' }}>From 4 USDC</div>
+          <div className="muted mb-1" style={{ fontSize: '0.85rem' }}>From 2.5 USDC</div>
           <button className="btn btn-primary" onClick={() => navigate('/buy?game=1')}>Play 6/49</button>
         </div>
       </div>
@@ -219,7 +225,7 @@ export default function Home() {
             <div className="admin-field mt-2">
               <label>Tally round</label>
               <div style={{ display: 'flex', gap: 8 }}>
-                <input type="number" placeholder="Round ID" value={tallyRound} onChange={(e) => setTallyRound(e.target.value)} />
+                <input type="number" min="1" placeholder="Round ID" value={tallyRound} onChange={(e) => setTallyRound(e.target.value)} />
                 <button className="btn btn-outline btn-sm" disabled={busy || !totoW} onClick={() => exec('Tally', () => totoW!.tallyBatch(Number(tallyRound), 500))}>
                   Tally
                 </button>
@@ -229,11 +235,15 @@ export default function Home() {
 
           <div className="card">
             <h3 className="mb-1">Sweep expired</h3>
-            <p className="muted mb-2">Returns unclaimed winnings to the general pool after expiry</p>
-            <div className="admin-field">
+            <p className="muted">Returns unclaimed winnings to the general pool after expiry</p>
+            {/* Invisible spacer mirrors the "Request draw" button so Round ID aligns with Tally round */}
+            <button className="btn btn-primary btn-sm mt-2" aria-hidden="true" tabIndex={-1} style={{ visibility: 'hidden' }}>
+              Request draw
+            </button>
+            <div className="admin-field mt-2">
               <label>Round ID</label>
               <div style={{ display: 'flex', gap: 8 }}>
-                <input type="number" placeholder="Round ID" value={sweepRound} onChange={(e) => setSweepRound(e.target.value)} />
+                <input type="number" min="1" placeholder="Round ID" value={sweepRound} onChange={(e) => setSweepRound(e.target.value)} />
                 <button className="btn btn-outline btn-sm" disabled={busy || !totoW} onClick={() => exec('Sweep', () => totoW!.sweepExpired(Number(sweepRound)))}>
                   Sweep
                 </button>

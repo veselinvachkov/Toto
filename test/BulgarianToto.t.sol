@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console2} from "forge-std/Test.sol";
 import {BulgarianToto} from "../src/BulgarianToto.sol";
 import {BulgarianTotoStorage} from "../src/BulgarianTotoStorage.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
@@ -29,6 +29,8 @@ contract BulgarianTotoTest is Test {
     uint8 constant GAME_5_35 = 0;
     uint8 constant GAME_6_49 = 1;
 
+    uint256 constant START_POOL = 100_000 * 1e6;
+
     function setUp() public virtual {
         usdc = new MockUSDC();
         vrf = new MockVRFCoordinator();
@@ -44,10 +46,10 @@ contract BulgarianTotoTest is Test {
             vm.prank(users[i]);
             usdc.approve(address(toto), type(uint256).max);
         }
-        // Donate a starting pool to make payouts non-zero on jackpot tests.
-        usdc.mint(address(this), 100_000 * 1e6);
+        // Donate a starting cumulative pool to make jackpot tests non-zero.
+        usdc.mint(address(this), START_POOL);
         usdc.approve(address(toto), type(uint256).max);
-        toto.donate(100_000 * 1e6);
+        toto.donate(START_POOL);
     }
 
     // ============================================================
@@ -111,11 +113,40 @@ contract BulgarianTotoTest is Test {
         vrf.fulfill(reqId, words);
     }
 
+    /// @dev Draw + fulfill whatever round is currently open, warping to its drawTime first.
+    function _drawCurrent(uint256 seed5, uint256 seed6) internal {
+        uint256 roundId = toto.currentRoundId();
+        vm.warp(toto.getRoundInfo(roundId).drawTime);
+        uint256 reqId = toto.requestDraw(roundId);
+        uint256[] memory words = new uint256[](2);
+        words[0] = seed5;
+        words[1] = seed6;
+        vrf.fulfill(reqId, words);
+    }
+
+    /// @dev Cumulative-pool snapshot captured for a round at requestDraw.
+    function _poolSnap(uint256 roundId) internal view returns (uint256) {
+        return uint256(toto.getRoundInfo(roundId).poolSnapshot);
+    }
+
     function _findNonWinningNumber5_35(uint64 drawnMask) internal pure returns (uint8) {
         for (uint8 i = 1; i <= 35; i++) {
             if ((drawnMask & (uint64(1) << i)) == 0) return i;
         }
         revert("no free");
+    }
+
+    function _findNonWinningNumber6_49(uint64 drawnMask) internal pure returns (uint8) {
+        for (uint8 i = 1; i <= 49; i++) {
+            if ((drawnMask & (uint64(1) << i)) == 0) return i;
+        }
+        revert("no free");
+    }
+
+    function _maskOf(uint8[] memory nums) internal pure returns (uint64 mask) {
+        for (uint256 i = 0; i < nums.length; i++) {
+            mask |= (uint64(1) << nums[i]);
+        }
     }
 
     // ============================================================
@@ -126,7 +157,9 @@ contract BulgarianTotoTest is Test {
         vm.prank(alice);
         uint256 id = toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
         assertEq(id, 0);
-        assertEq(toto.availablePool(), 100_000 * 1e6 + 3 * 1e6);
+        // Buying does not touch the cumulative pool; it accrues to the round's game stake.
+        assertEq(toto.cumulativePool(), START_POOL);
+        assertEq(uint256(toto.getRoundInfo(0).stake5), 1_500_000);
         assertEq(toto.roundTicketCount(0), 1);
     }
 
@@ -137,7 +170,8 @@ contract BulgarianTotoTest is Test {
         }
         vm.prank(bob);
         toto.buyTicket(GAME_6_49, picks);
-        assertEq(toto.availablePool(), 100_000 * 1e6 + 9 * 1e6);
+        assertEq(toto.cumulativePool(), START_POOL);
+        assertEq(uint256(toto.getRoundInfo(0).stake6), 21 * 1e6);
     }
 
     function test_BuyTicket_Reverts_OnInvalidGame() public {
@@ -214,7 +248,7 @@ contract BulgarianTotoTest is Test {
         toto.pause();
         vm.prank(alice);
         toto.refund(id);
-        assertEq(usdc.balanceOf(alice), balBefore + 3 * 1e6);
+        assertEq(usdc.balanceOf(alice), balBefore + 1_500_000);
     }
 
     // ============================================================
@@ -228,8 +262,10 @@ contract BulgarianTotoTest is Test {
         vm.warp(block.timestamp + 30 minutes);
         vm.prank(alice);
         toto.refund(id);
-        assertEq(usdc.balanceOf(alice), balBefore + 3 * 1e6);
-        assertEq(toto.availablePool(), 100_000 * 1e6);
+        assertEq(usdc.balanceOf(alice), balBefore + 1_500_000);
+        // Refund reverses the round stake; pool untouched.
+        assertEq(uint256(toto.getRoundInfo(0).stake5), 0);
+        assertEq(toto.cumulativePool(), START_POOL);
     }
 
     function test_Refund_AfterWindow_Reverts() public {
@@ -273,10 +309,10 @@ contract BulgarianTotoTest is Test {
     // ============================================================
 
     function test_Donate_GrowsPool() public {
-        uint256 before = toto.availablePool();
+        uint256 before = toto.cumulativePool();
         vm.prank(alice);
         toto.donate(50 * 1e6);
-        assertEq(toto.availablePool(), before + 50 * 1e6);
+        assertEq(toto.cumulativePool(), before + 50 * 1e6);
     }
 
     function test_Donate_RevertsOnZero() public {
@@ -294,20 +330,29 @@ contract BulgarianTotoTest is Test {
         toto.requestDraw(0);
     }
 
-    function test_RequestDraw_AdvancesRoundAndEarmarks() public {
+    function test_RequestDraw_SplitsFundsAndEarmarks() public {
         vm.prank(alice);
-        toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
+        toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5)); // stake5 = 3e6
 
         vm.warp(firstDrawTime);
-        uint256 poolBefore = toto.availablePool();
+        uint256 poolBefore = toto.cumulativePool(); // START_POOL donation
+        uint256 treasuryBefore = usdc.balanceOf(treasuryAddr);
         toto.requestDraw(0);
 
         assertEq(toto.currentRoundId(), 1);
-        // Treasury skims TREASURY_BPS first, then earmark is MAX_PAYOUT_BPS of the post-skim pool.
-        uint256 postSkim = poolBefore - poolBefore * toto.TREASURY_BPS() / 10000;
-        uint256 expectedEarmark = postSkim * toto.MAX_PAYOUT_BPS() / 10000;
-        assertEq(toto.earmarkedForRound(0), expectedEarmark);
-        assertEq(toto.availablePool(), postSkim - expectedEarmark);
+
+        uint256 stake = 1_500_000;
+        uint256 total = stake;
+        uint256 fee = total * toto.TREASURY_BPS() / 10000;            // 2%
+        uint256 lowerReserve = stake * toto.LOWER_FUND_BPS() / 10000; // 50% of 5/35 stake
+        uint256 poolAdd = total - fee - lowerReserve;                 // 48% to pool
+        uint256 snap = poolBefore + poolAdd;
+        uint256 jackEarmark = snap * toto.MAX_JACKPOT_BPS() / 10000;  // 60% of snapshot
+
+        assertEq(usdc.balanceOf(treasuryAddr) - treasuryBefore, fee);
+        assertEq(_poolSnap(0), snap);
+        assertEq(toto.earmarkedForRound(0), lowerReserve + jackEarmark);
+        assertEq(toto.cumulativePool(), snap - jackEarmark);
     }
 
     function test_AnyoneCanRequestDraw() public {
@@ -317,15 +362,122 @@ contract BulgarianTotoTest is Test {
         assertEq(toto.currentRoundId(), 1);
     }
 
-    function test_NextRoundDrawTimeIsPlus48h() public {
+    function test_NextRoundDrawTimeIsPlusDefaultInterval() public {
         vm.warp(firstDrawTime);
         toto.requestDraw(0);
-        (uint64 dt,,,,,, ) = toto.rounds(1);
-        assertEq(dt, firstDrawTime + 48 hours);
+        // Default cadence is 2 days.
+        assertEq(toto.drawInterval(), 2 days);
+        assertEq(toto.getRoundInfo(1).drawTime, firstDrawTime + 2 days);
     }
 
     // ============================================================
-    // FULL FLOW: 5/35 JACKPOT
+    // ADMIN: DRAW INTERVAL (default 2 days, change effective after 2 draws)
+    // ============================================================
+
+    function test_DefaultDrawIntervalIs2Days() public view {
+        assertEq(toto.drawInterval(), 2 days);
+        assertEq(toto.DEFAULT_DRAW_INTERVAL(), 2 days);
+    }
+
+    function test_SetDrawInterval_OnlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        toto.setDrawInterval(5 days);
+    }
+
+    // ============================================================
+    // SET TICKET PRICE TESTS
+    // ============================================================
+
+    event TicketPriceChanged(uint8 indexed game, uint8 indexed k, uint256 oldPrice, uint256 newPrice);
+
+    function test_SetTicketPrice_OnlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        toto.setTicketPrice(GAME_5_35, 5, 2_000_000);
+    }
+
+    function test_SetTicketPrice_UpdatesPriceAndEmits() public {
+        assertEq(toto.ticketPrice(GAME_5_35, 5), 1_500_000);
+
+        vm.expectEmit(true, true, false, true);
+        emit TicketPriceChanged(GAME_5_35, 5, 1_500_000, 3_000_000);
+        toto.setTicketPrice(GAME_5_35, 5, 3_000_000);
+
+        assertEq(toto.ticketPrice(GAME_5_35, 5), 3_000_000);
+        // Other prices are untouched.
+        assertEq(toto.ticketPrice(GAME_6_49, 8), 21 * 1e6);
+    }
+
+    function test_SetTicketPrice_NewPriceUsedOnBuy() public {
+        toto.setTicketPrice(GAME_5_35, 5, 4_000_000);
+
+        vm.prank(alice);
+        toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
+        // The round stake reflects the NEW price, not the old default.
+        assertEq(uint256(toto.getRoundInfo(0).stake5), 4_000_000);
+    }
+
+    function test_SetTicketPrice_Rejects_Zero() public {
+        vm.expectRevert(BulgarianTotoStorage.InvalidPrice.selector);
+        toto.setTicketPrice(GAME_5_35, 5, 0);
+    }
+
+    function test_SetTicketPrice_Rejects_AboveUint128Max() public {
+        vm.expectRevert(BulgarianTotoStorage.InvalidPrice.selector);
+        toto.setTicketPrice(GAME_5_35, 5, uint256(type(uint128).max) + 1);
+    }
+
+    function test_SetTicketPrice_Rejects_InvalidPickCount() public {
+        // K=8 is not valid for the 5/35 game.
+        vm.expectRevert(BulgarianTotoStorage.InvalidPickCount.selector);
+        toto.setTicketPrice(GAME_5_35, 8, 2_000_000);
+    }
+
+    function test_SetDrawInterval_RejectsOutOfRange() public {
+        uint256 minI = toto.MIN_DRAW_INTERVAL();
+        uint256 maxI = toto.MAX_DRAW_INTERVAL();
+
+        vm.expectRevert(BulgarianTotoStorage.IntervalOutOfRange.selector);
+        toto.setDrawInterval(minI - 1);
+
+        vm.expectRevert(BulgarianTotoStorage.IntervalOutOfRange.selector);
+        toto.setDrawInterval(maxI + 1);
+    }
+
+    function test_SetDrawInterval_QueuesAndDoesNotApplyImmediately() public {
+        toto.setDrawInterval(5 days);
+        // Queued, but the active interval is unchanged until activation.
+        assertEq(toto.drawInterval(), 2 days);
+        assertEq(toto.pendingDrawInterval(), 5 days);
+        assertEq(toto.pendingIntervalActiveRound(), 2); // currentRoundId(0) + 2
+    }
+
+    function test_SetDrawInterval_TakesEffectAfterTwoDraws() public {
+        // currentRound = 0. Queue a change to 5 days.
+        toto.setDrawInterval(5 days);
+
+        // Draw 0 -> opens round 1. nextId(1) < activeRound(2): still the old 2-day spacing.
+        uint64 t0 = toto.getRoundInfo(0).drawTime;
+        _drawCurrent(0xA, 0xB);
+        assertEq(toto.drawInterval(), 2 days, "interval must not change on first draw");
+        assertEq(toto.getRoundInfo(1).drawTime, t0 + 2 days);
+
+        // Draw 1 -> opens round 2. nextId(2) >= activeRound(2): new 5-day spacing activates.
+        uint64 t1 = toto.getRoundInfo(1).drawTime;
+        _drawCurrent(0xC, 0xD);
+        assertEq(toto.drawInterval(), 5 days, "interval must activate on second draw");
+        assertEq(toto.pendingDrawInterval(), 0, "pending must be cleared after activation");
+        assertEq(toto.getRoundInfo(2).drawTime, t1 + 5 days);
+
+        // Draw 2 -> opens round 3: continues at the new 5-day spacing.
+        uint64 t2 = toto.getRoundInfo(2).drawTime;
+        _drawCurrent(0xE, 0xF);
+        assertEq(toto.getRoundInfo(3).drawTime, t2 + 5 days);
+    }
+
+    // ============================================================
+    // FULL FLOW: 5/35 JACKPOT (5 numbers = % of cumulative pool)
     // ============================================================
 
     function test_HappyPath_5of35_Jackpot() public {
@@ -333,18 +485,15 @@ contract BulgarianTotoTest is Test {
         uint256 seed6 = 0xBBBB;
         (, uint8[] memory drawn5) = _expectedDraw(seed5, 35, 5);
 
-        // Alice buys the winning 5 numbers.
         vm.prank(alice);
         uint256 ticketId = toto.buyTicket(GAME_5_35, drawn5);
 
         _runDraw(seed5, seed6);
-        (,,,,uint128 snap,,) = toto.rounds(0);
-        uint256 poolAtDraw = uint256(snap);
+        uint256 snap = _poolSnap(0);
 
-        // Tally and finalize.
         toto.tallyBatch(0, 100);
 
-        uint256 expected = poolAtDraw * 1500 / 10000; // 15% of snapshot pool
+        uint256 expected = snap * toto.JACKPOT_BPS_5_35() / 10000; // 10% of pool snapshot
         assertEq(toto.previewClaim(ticketId), expected);
 
         uint256 balBefore = usdc.balanceOf(alice);
@@ -354,7 +503,7 @@ contract BulgarianTotoTest is Test {
     }
 
     // ============================================================
-    // FULL FLOW: 6/49 JACKPOT
+    // FULL FLOW: 6/49 JACKPOT (6 numbers = % of cumulative pool)
     // ============================================================
 
     function test_HappyPath_6of49_Jackpot() public {
@@ -366,11 +515,10 @@ contract BulgarianTotoTest is Test {
         uint256 ticketId = toto.buyTicket(GAME_6_49, drawn6);
 
         _runDraw(seed5, seed6);
-        (,,,,uint128 snap,,) = toto.rounds(0);
-        uint256 poolAtDraw = uint256(snap);
+        uint256 snap = _poolSnap(0);
         toto.tallyBatch(0, 100);
 
-        uint256 expected = poolAtDraw * 5500 / 10000; // 55%
+        uint256 expected = snap * toto.JACKPOT_BPS_6_49() / 10000; // 50% of pool snapshot
         uint256 balBefore = usdc.balanceOf(bob);
         vm.prank(bob);
         toto.claim(ticketId);
@@ -378,7 +526,50 @@ contract BulgarianTotoTest is Test {
     }
 
     // ============================================================
-    // PRO-RATA SPLIT
+    // LOWER TIER: 6/49 four-number prize = % of 6/49 round stake
+    // ============================================================
+
+    function test_LowerTier_6of49_FourNumbers_FromGameStake() public {
+        uint256 seed5 = 0x1234;
+        uint256 seed6 = 0x5678;
+        (uint64 mask6, uint8[] memory drawn6) = _expectedDraw(seed6, 49, 6);
+
+        // Build a base 6/49 ticket matching exactly 4 drawn numbers (tier 4).
+        uint8 miss1 = _findNonWinningNumber6_49(mask6);
+        uint8 miss2 = miss1 + 1;
+        while ((mask6 & (uint64(1) << miss2)) != 0 || miss2 > 49) {
+            miss2++;
+        }
+        uint8[] memory picks = _picks6_49Base(drawn6[0], drawn6[1], drawn6[2], drawn6[3], miss1, miss2);
+
+        // A second whale 6/49 ticket so the round stake (and thus the tier-4 budget) is sizeable.
+        uint8[] memory whale = new uint8[](8);
+        for (uint8 i = 0; i < 8; i++) {
+            whale[i] = 30 + i; // arbitrary high numbers, not all drawn
+        }
+
+        vm.prank(alice);
+        uint256 ticketId = toto.buyTicket(GAME_6_49, picks); // 4 USDC base
+        vm.prank(bob);
+        toto.buyTicket(GAME_6_49, whale); // 9 USDC +2
+
+        _runDraw(seed5, seed6);
+        uint256 stake6 = uint256(toto.getRoundInfo(0).stake6);
+        toto.tallyBatch(0, 100);
+
+        // Tier-4 budget = stake6 * LBPS_6_49_TIER4. Alice is the only tier-4 winner here
+        // (her 4 matches; the whale's high numbers don't form a 4-of-6 hit on this draw).
+        // The assertion below is robust regardless: she gets budget * herHits / totalHits.
+        uint256 tier4Budget = stake6 * toto.LBPS_6_49_TIER4() / 10000;
+        assertTrue(tier4Budget > 0);
+
+        uint256 preview = toto.previewClaim(ticketId);
+        assertTrue(preview > 0, "alice should win the 4-number tier");
+        assertTrue(preview <= tier4Budget, "payout cannot exceed the tier budget");
+    }
+
+    // ============================================================
+    // PRO-RATA SPLIT (two 5/35 jackpot winners)
     // ============================================================
 
     function test_ProRata_TwoJackpotWinners_5of35() public {
@@ -392,11 +583,10 @@ contract BulgarianTotoTest is Test {
         uint256 idB = toto.buyTicket(GAME_5_35, drawn5);
 
         _runDraw(seed5, seed6);
-        (,,,,uint128 snap,,) = toto.rounds(0);
-        uint256 poolAtDraw = uint256(snap);
+        uint256 snap = _poolSnap(0);
         toto.tallyBatch(0, 100);
 
-        uint256 totalPrize = poolAtDraw * 1500 / 10000;
+        uint256 totalPrize = snap * toto.JACKPOT_BPS_5_35() / 10000;
         uint256 perWinner = totalPrize / 2;
 
         vm.prank(alice);
@@ -404,12 +594,12 @@ contract BulgarianTotoTest is Test {
         vm.prank(bob);
         toto.claim(idB);
 
-        assertEq(usdc.balanceOf(alice), 1_000_000 * 1e6 - 3 * 1e6 + perWinner);
-        assertEq(usdc.balanceOf(bob), 1_000_000 * 1e6 - 3 * 1e6 + perWinner);
+        assertEq(usdc.balanceOf(alice), 1_000_000 * 1e6 - 1_500_000 + perWinner);
+        assertEq(usdc.balanceOf(bob), 1_000_000 * 1e6 - 1_500_000 + perWinner);
     }
 
     // ============================================================
-    // SYSTEM TICKET (+2): sub-ticket math
+    // SYSTEM TICKET (+2): sub-ticket math across jackpot + lower tiers
     // ============================================================
 
     function test_SystemTicket_5of35_Plus2_AllFiveDrawnInside() public {
@@ -424,7 +614,6 @@ contract BulgarianTotoTest is Test {
         }
         uint8 extra1 = _findNonWinningNumber5_35(_maskOf(drawn5));
         uint8 extra2 = extra1 + 1;
-        // ensure extra2 is also not drawn
         while ((_maskOf(drawn5) & (uint64(1) << extra2)) != 0 || extra2 > 35) {
             extra2++;
         }
@@ -435,29 +624,56 @@ contract BulgarianTotoTest is Test {
         uint256 ticketId = toto.buyTicket(GAME_5_35, picks);
 
         _runDraw(seed5, seed6);
-        (,,,,uint128 snap,,) = toto.rounds(0);
-        uint256 poolAtDraw = uint256(snap);
+        uint256 snap = _poolSnap(0);
+        uint256 stake5 = uint256(toto.getRoundInfo(0).stake5); // 7 USDC (the only ticket)
         toto.tallyBatch(0, 100);
 
-        // m = 5 hits across 7 picks → sub-ticket distribution:
-        // tier 5 hits: C(5,5)*C(2,0) = 1
-        // tier 4 hits: C(5,4)*C(2,1) = 5*2 = 10
-        // tier 3 hits: C(5,3)*C(2,2) = 10*1 = 10
-        // Alice is the only ticket in each tier → she takes the entire tier budget for each.
+        // m = 5 hits across 7 picks -> sub-ticket distribution:
+        //   tier 5 (jackpot) hits: C(5,5)*C(2,0) = 1   -> budget = snap  * JACKPOT_BPS_5_35
+        //   tier 4 (lower)   hits: C(5,4)*C(2,1) = 10   -> budget = stake5 * LBPS_5_35_TIER4
+        //   tier 3 (lower)   hits: C(5,3)*C(2,2) = 10   -> budget = stake5 * LBPS_5_35_TIER3
+        // Alice is the only ticket in each tier -> she takes each tier budget in full.
         uint256 expected =
-            poolAtDraw * 1500 / 10000 // tier5 (15%)
-                + poolAtDraw * 100 / 10000 // tier4 (1%)
-                + poolAtDraw * 20 / 10000; // tier3 (0.2%)
+            snap * toto.JACKPOT_BPS_5_35() / 10000
+                + stake5 * toto.LBPS_5_35_TIER4() / 10000
+                + stake5 * toto.LBPS_5_35_TIER3() / 10000;
         uint256 balBefore = usdc.balanceOf(alice);
         vm.prank(alice);
         toto.claim(ticketId);
         assertEq(usdc.balanceOf(alice) - balBefore, expected);
     }
 
-    function _maskOf(uint8[] memory nums) internal pure returns (uint64 mask) {
-        for (uint256 i = 0; i < nums.length; i++) {
-            mask |= (uint64(1) << nums[i]);
+    // ============================================================
+    // ROLLOVER: unwon jackpot stays in the pool
+    // ============================================================
+
+    function test_Rollover_NoJackpotWinner_PoolGrows() public {
+        // Buy only losing tickets so neither jackpot is hit; the pool should retain its
+        // earmarked jackpot (rollover) plus the 48% contribution from the round stakes.
+        uint256 seed5 = 0x4242;
+        uint256 seed6 = 0x4343;
+        (uint64 mask5,) = _expectedDraw(seed5, 35, 5);
+
+        // 5 numbers that are NOT drawn -> 0 matches.
+        uint8[] memory picks = new uint8[](5);
+        uint256 placed = 0;
+        for (uint8 i = 1; i <= 35 && placed < 5; i++) {
+            if ((mask5 & (uint64(1) << i)) == 0) picks[placed++] = i;
         }
+        vm.prank(alice);
+        toto.buyTicket(GAME_5_35, picks);
+
+        uint256 poolBeforeDraw = toto.cumulativePool();
+        _runDraw(seed5, seed6);
+        toto.tallyBatch(0, 100);
+
+        // No winners at all -> all reserved funds roll back into the pool.
+        // Final pool = poolBeforeDraw + 48% of stake (treasury took 2%, lower funds had
+        // no winners so they also rolled in, jackpot unwon so its earmark rolled back).
+        uint256 stake = 1_500_000;
+        uint256 fee = stake * toto.TREASURY_BPS() / 10000;
+        assertEq(toto.cumulativePool(), poolBeforeDraw + stake - fee);
+        assertEq(toto.earmarkedForRound(0), 0);
     }
 
     // ============================================================
@@ -469,7 +685,6 @@ contract BulgarianTotoTest is Test {
         uint256 seed6 = 0x4343;
         (uint64 mask5,) = _expectedDraw(seed5, 35, 5);
 
-        // Build a losing ticket with 0 hits - first 5 numbers not in drawn mask.
         uint8[] memory picks = new uint8[](5);
         uint256 placed = 0;
         for (uint8 i = 1; i <= 35 && placed < 5; i++) {
@@ -495,7 +710,7 @@ contract BulgarianTotoTest is Test {
         vm.prank(alice);
         uint256 id = toto.buyTicket(GAME_5_35, drawn5);
         _runDraw(seed5, seed6);
-        // tally NOT called → still Tallying, not Claimable
+        // tally NOT called -> still Tallying, not Claimable
         vm.expectRevert(BulgarianTotoStorage.WrongRoundState.selector);
         vm.prank(alice);
         toto.claim(id);
@@ -513,18 +728,17 @@ contract BulgarianTotoTest is Test {
         uint256 id = toto.buyTicket(GAME_5_35, drawn5);
 
         _runDraw(seed5, seed6);
-        (,,,,uint128 snap,,) = toto.rounds(0);
-        uint256 poolAtDraw = uint256(snap);
+        uint256 snap = _poolSnap(0);
         toto.tallyBatch(0, 100);
 
-        uint256 prize = poolAtDraw * 1500 / 10000;
-        uint256 poolAfterFinalize = toto.availablePool();
+        uint256 prize = snap * toto.JACKPOT_BPS_5_35() / 10000;
+        uint256 poolAfterFinalize = toto.cumulativePool();
 
         // Alice never claims. Warp past expiry.
         vm.warp(uint256(firstDrawTime) + 365 days);
         toto.sweepExpired(0);
 
-        assertEq(toto.availablePool(), poolAfterFinalize + prize);
+        assertEq(toto.cumulativePool(), poolAfterFinalize + prize);
 
         // After sweep, claim must revert.
         vm.expectRevert(BulgarianTotoStorage.WrongRoundState.selector);
@@ -535,7 +749,6 @@ contract BulgarianTotoTest is Test {
     function test_Sweep_TooEarly_Reverts() public {
         uint256 seed5 = 0x55;
         uint256 seed6 = 0x66;
-        // Buy at least one ticket so the round actually has a tally step.
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
         _runDraw(seed5, seed6);
@@ -548,8 +761,7 @@ contract BulgarianTotoTest is Test {
     // POOL ACCOUNTING INVARIANT
     // ============================================================
 
-    function test_AvailablePool_PlusEarmarks_EqualsContractBalance() public {
-        // Buys + donate
+    function test_PoolPlusEarmarks_EqualsContractBalance() public {
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
         vm.prank(bob);
@@ -557,13 +769,12 @@ contract BulgarianTotoTest is Test {
         vm.prank(carol);
         toto.donate(123 * 1e6);
 
-        // Draw round 0
         _runDraw(0xABC, 0xDEF);
         toto.tallyBatch(0, 100);
 
-        uint256 sum = toto.availablePool() + toto.earmarkedForRound(0);
-        // Some prize budget may have been already removed for tiers with winners,
-        // so the live invariant is: contract balance == availablePool + earmarked.
+        // Right after finalize (before any claim): contract balance is exactly the
+        // cumulative pool plus whatever is still earmarked for the finalized round.
+        uint256 sum = toto.cumulativePool() + toto.earmarkedForRound(0);
         assertEq(usdc.balanceOf(address(toto)), sum);
     }
 
@@ -578,7 +789,7 @@ contract BulgarianTotoTest is Test {
         vm.prank(alice);
         toto.transferTicket(id, bob);
 
-        (address newOwner,,,,,,,,) = toto.tickets(id);
+        (address newOwner,,,,,,,) = toto.tickets(id);
         assertEq(newOwner, bob);
     }
 
@@ -590,7 +801,6 @@ contract BulgarianTotoTest is Test {
         vm.prank(alice);
         uint256 id = toto.buyTicket(GAME_5_35, drawn5);
 
-        // Alice transfers to bob before the draw.
         vm.prank(alice);
         toto.transferTicket(id, bob);
 
@@ -678,7 +888,6 @@ contract BulgarianTotoTest is Test {
         uint256 seed6 = 0x2222;
         (, uint8[] memory drawn5) = _expectedDraw(seed5, 35, 5);
 
-        // Alice buys two identical winning tickets.
         vm.prank(alice);
         uint256 idA = toto.buyTicket(GAME_5_35, drawn5);
         vm.prank(alice);
@@ -703,7 +912,6 @@ contract BulgarianTotoTest is Test {
         uint256 seed6 = 0x4343;
         (uint64 mask5,) = _expectedDraw(seed5, 35, 5);
 
-        // Buy a losing ticket (no matching numbers).
         uint8[] memory picks = new uint8[](5);
         uint256 placed = 0;
         for (uint8 i = 1; i <= 35 && placed < 5; i++) {
@@ -739,6 +947,8 @@ contract BulgarianTotoTest is Test {
         assertEq(info.drawTime, firstDrawTime);
         assertEq(uint8(info.state), uint8(BulgarianTotoStorage.RoundState.Open));
         assertEq(info.ticketCount, 2);
+        assertEq(uint256(info.stake5), 1_500_000);
+        assertEq(uint256(info.stake6), 2_500_000);
     }
 
     function test_GetRoundTiers_AfterFinalize() public {
@@ -752,7 +962,7 @@ contract BulgarianTotoTest is Test {
         toto.tallyBatch(0, 100);
 
         (BulgarianTotoStorage.TierState[3] memory t5,) = toto.getRoundTiers(0);
-        // Tier 5 (index 2) should have budget > 0 since alice hit the jackpot.
+        // Tier 5 (index 2) is the jackpot tier; alice hit it.
         assertTrue(t5[2].budget > 0);
         assertEq(t5[2].totalHits, 1);
     }
@@ -781,13 +991,11 @@ contract BulgarianTotoTest is Test {
     function test_IsWinner() public {
         uint256 seed5 = 0xAAAA;
         uint256 seed6 = 0xBBBB;
-        (, uint8[] memory drawn5) = _expectedDraw(seed5, 35, 5);
+        (uint64 mask5, uint8[] memory drawn5) = _expectedDraw(seed5, 35, 5);
 
         vm.prank(alice);
         uint256 winId = toto.buyTicket(GAME_5_35, drawn5);
 
-        // Non-winning ticket.
-        (uint64 mask5,) = _expectedDraw(seed5, 35, 5);
         uint8[] memory losingPicks = new uint8[](5);
         uint256 placed = 0;
         for (uint8 i = 1; i <= 35 && placed < 5; i++) {
@@ -809,37 +1017,28 @@ contract BulgarianTotoTest is Test {
     // CATCH-UP
     // ============================================================
 
-    /// @dev Open round whose drawTime has passed → catchUp triggers requestDraw.
-    /// @dev catchUp triggers AT MOST ONE requestDraw per call (conservative: avoids
-    ///      burning LINK on a cascade of empty rounds when DRAW_INTERVAL is short
-    ///      relative to the missed period).
     function test_CatchUp_OpenWithPassedDrawTime_TriggersRequestDraw() public {
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
 
-        // Long delay: nobody calls requestDraw for many DRAW_INTERVALs.
         vm.warp(firstDrawTime + 30 days);
 
         uint256 cur = toto.currentRoundId();
         uint256 actions = toto.catchUp(0, 50, 500);
 
         assertEq(actions, 1, "exactly one requestDraw per catchUp call");
-        // Round 0 should now be AwaitingVRF and round 1 should exist (Open).
         BulgarianTotoStorage.RoundInfo memory r0 = toto.getRoundInfo(0);
         assertEq(uint8(r0.state), uint8(BulgarianTotoStorage.RoundState.AwaitingVRF));
         assertEq(toto.currentRoundId(), cur + 1);
     }
 
-    /// @dev Tallying round → catchUp triggers tallyBatch and finalizes.
     function test_CatchUp_TallyingRound_FinalizesIt() public {
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
 
-        // Move to AwaitingVRF then fulfill so state is Tallying.
         _runDraw(0xAAAA, 0xBBBB);
 
         BulgarianTotoStorage.RoundInfo memory rBefore = toto.getRoundInfo(0);
-        // With 1 ticket, fulfillRandomWords moves to Tallying (not auto-finalize).
         assertEq(uint8(rBefore.state), uint8(BulgarianTotoStorage.RoundState.Tallying));
 
         uint256 actions = toto.catchUp(0, 10, 500);
@@ -849,18 +1048,15 @@ contract BulgarianTotoTest is Test {
         assertEq(uint8(rAfter.state), uint8(BulgarianTotoStorage.RoundState.Claimable));
     }
 
-    /// @dev Claimable round past expiry → catchUp triggers sweepExpired.
     function test_CatchUp_ExpiredClaimable_TriggersSweep() public {
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
         _runDraw(0xAAAA, 0xBBBB);
         toto.tallyBatch(0, 500);
 
-        // Past expiry now.
         BulgarianTotoStorage.RoundInfo memory r = toto.getRoundInfo(0);
         vm.warp(r.expiryTime + 1);
 
-        // Scope only round 0 to isolate the sweep from round 1's auto-requestDraw.
         uint256 actions = toto.catchUp(0, 1, 500);
         assertEq(actions, 1, "should have done 1 action: sweepExpired");
 
@@ -868,7 +1064,6 @@ contract BulgarianTotoTest is Test {
         assertEq(uint8(rAfter.state), uint8(BulgarianTotoStorage.RoundState.Expired));
     }
 
-    /// @dev AwaitingVRF round → catchUp leaves it untouched (no VRF available).
     function test_CatchUp_AwaitingVRF_SkipsSilently() public {
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
@@ -886,7 +1081,6 @@ contract BulgarianTotoTest is Test {
         assertEq(uint8(r0After.state), uint8(BulgarianTotoStorage.RoundState.AwaitingVRF));
     }
 
-    /// @dev Idempotent: running catchUp on a fully-settled chain does nothing.
     function test_CatchUp_Idempotent() public {
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
@@ -897,21 +1091,15 @@ contract BulgarianTotoTest is Test {
         assertEq(actions, 0, "settled state should not produce actions");
     }
 
-    /// @dev Mixed pipeline in one call: Tallying first, then triggers requestDraw on
-    ///      the next-current Open round whose drawTime has also passed.
     function test_CatchUp_HandlesMultipleStatesInOneCall() public {
-        // Round 0: get to Tallying with 1 ticket
         vm.prank(alice);
         toto.buyTicket(GAME_5_35, _picks5_35Base(1, 2, 3, 4, 5));
         _runDraw(0xAAAA, 0xBBBB);
-        // Round 0 is now Tallying. Round 1 is Open with drawTime = firstDrawTime + INTERVAL.
 
-        // Warp so that round 1's drawTime has also passed.
         BulgarianTotoStorage.RoundInfo memory r1 = toto.getRoundInfo(1);
         vm.warp(r1.drawTime + 1);
 
         uint256 actions = toto.catchUp(0, 50, 500);
-        // Expected: 1) tallyBatch(0) → Claimable. 2) requestDraw(1) → AwaitingVRF.
         assertEq(actions, 2, "should have tallied round 0 AND requested draw on round 1");
 
         BulgarianTotoStorage.RoundInfo memory r0After = toto.getRoundInfo(0);

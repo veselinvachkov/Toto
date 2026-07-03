@@ -10,16 +10,29 @@ import { useConnectorClient } from 'wagmi';
 
 const SEPOLIA = Network.from(11155111);
 
-// Multiple public Sepolia endpoints behind a quorum-1 FallbackProvider: a
-// single public RPC rate-limits (HTTP 429) under read bursts, which blanked
-// the UI. The provider fails over to the next endpoint on error/stall.
+// Several Sepolia endpoints behind a FallbackProvider (quorum 1): each request
+// goes to the highest-priority endpoint and transparently fails over to the
+// next on error/stall, so one throttled node never blanks the page.
 // `staticNetwork` also drops the per-request eth_chainId round-trip.
-const RPC_URLS = [
+//
+// SCALE: public RPCs rate-limit hard (HTTP 429) and will not survive tens of
+// thousands of concurrent readers. Point `VITE_RPC_URLS` (comma-separated) at a
+// dedicated provider (Alchemy/Infura/QuickNode) or your own proxy in
+// production. The public list below is only a development / fallback default.
+const PUBLIC_RPC_URLS = [
   'https://ethereum-sepolia-rpc.publicnode.com',
   'https://sepolia.drpc.org',
   'https://1rpc.io/sepolia',
   'https://rpc.sepolia.org',
 ];
+
+const RPC_URLS = (() => {
+  const fromEnv = (import.meta.env.VITE_RPC_URLS as string | undefined)
+    ?.split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
+  return fromEnv && fromEnv.length > 0 ? fromEnv : PUBLIC_RPC_URLS;
+})();
 
 /** Public read-only provider (no wallet required). */
 export const readProvider = new FallbackProvider(

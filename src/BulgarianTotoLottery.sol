@@ -11,9 +11,12 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {BulgarianTotoStorage} from "./BulgarianTotoStorage.sol";
 
 /// @title  BulgarianTotoLottery
-/// @notice Lottery layer: ticket purchase, draw, tally, claim, refund, sweep, +
-///         the lottery-side of LP accounting hooks (totalLpAssets / lpAssetsAtSnap /
-///         _snapshotLp). Pure LP entry points live in BulgarianTotoLpVault.
+/// @notice Lottery layer: ticket purchase, draw, tally, claim, refund, sweep.
+/// @dev    Prize model (see BulgarianTotoStorage header): each game's lower tiers are
+///         funded by 50% of that game's round stakes; the top tier (jackpot) is a
+///         percentage of the common cumulative pool snapshot taken at draw time. A 10%
+///         treasury fee is skimmed from total round stakes; the rest feeds the pool.
+///         Unwon prizes (lower tiers and jackpots) roll into the cumulative pool.
 abstract contract BulgarianTotoLottery is
     VRFConsumerBaseV2Plus,
     ReentrancyGuard,
@@ -51,13 +54,14 @@ abstract contract BulgarianTotoLottery is
         uint256 price = _ticketPrice(game, k);
 
         usdc.safeTransferFrom(msg.sender, address(this), price);
-        availablePool += price;
 
-        // LPs absorb 100% of ticket revenue (and 100% of refunds via the matching debit
-        // gated on lpCreditedAtBuy). When no LPs exist the revenue stays as house surplus.
-        bool lpCredited = totalLpShares > 0;
-        if (lpCredited) {
-            totalLpAssets += price;
+
+        // Track per-game stakes for this round; they drive both the lower-tier funds
+        // (50% of the game's stakes) and the treasury fee at requestDraw.
+        if (game == GAME_5_35) {
+            r.stake5 += uint128(price);
+        } else {
+            r.stake6 += uint128(price);
         }
 
         ticketId = tickets.length;
@@ -68,10 +72,10 @@ abstract contract BulgarianTotoLottery is
                 purchaseTime: uint32(block.timestamp),
                 game: game,
                 k: k,
+                pricePaid: uint128(price),
                 claimed: false,
                 refunded: false,
-                picksMask: picksMask,
-                lpCreditedAtBuy: lpCredited
+                picksMask: picksMask
             })
         );
         _roundTickets[roundId].push(ticketId);
@@ -80,16 +84,44 @@ abstract contract BulgarianTotoLottery is
         emit TicketBought(ticketId, roundId, msg.sender, game, k, picksMask, price);
     }
 
-    /// @notice Add USDC directly to the prize pool (anyone can donate).
+    /// @notice Add USDC directly to the cumulative jackpot pool (anyone can donate).
     /// @param amount The USDC amount to donate (must be > 0).
     function donate(uint256 amount) external nonReentrant {
         if (amount == 0) revert AmountZero();
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        availablePool += amount;
-        if (totalLpShares > 0) {
-            totalLpAssets += amount;
+        cumulativePool += amount;
+        // Track the owner's own donations so they (and only they) can later be reclaimed to
+        // the treasury. Donations from any other address are never counted here, so the
+        // reclaim path can never reach another user's funds.
+        if (msg.sender == owner()) {
+            ownerDonations += amount;
         }
         emit Donation(msg.sender, amount);
+    }
+
+    /// @notice Reclaim a portion of the OWNER's own donations from the cumulative pool and
+    ///         send it to the treasury. The owner chooses the exact `amount`.
+    /// @dev    The amount is capped twice, and both caps are required:
+    ///           1. `ownerDonations` — the owner can never reclaim more than they personally
+    ///              donated and have not already reclaimed. This guarantees no other donor's
+    ///              contribution, no player's stake, and no won prize can be touched.
+    ///           2. `cumulativePool` — only the unencumbered pool is reachable. Earmarked
+    ///              jackpots, frozen lower-tier budgets and refundable stakes are held in
+    ///              separate accounting (`earmarkedForRound`, `tierState`) and are untouched.
+    ///              If earlier jackpots already paid out the donated funds, this cap limits
+    ///              the reclaim to whatever actually remains in the pool.
+    ///         Funds go to `treasury`, never to the caller. CEI ordering + nonReentrant.
+    /// @param amount USDC amount (6 decimals) to move from the pool to the treasury.
+    function reclaimOwnerDonation(uint256 amount) external onlyOwner nonReentrant {
+        if (amount == 0) revert AmountZero();
+        if (amount > ownerDonations) revert InsufficientOwnerDonations();
+        if (amount > cumulativePool) revert PoolUnderflow();
+
+        ownerDonations -= amount;
+        cumulativePool -= amount;
+        usdc.safeTransfer(treasury, amount);
+
+        emit OwnerDonationReclaimed(amount, treasury, ownerDonations);
     }
 
     /// @notice Refund a ticket within REFUND_WINDOW of purchase, but only while
@@ -108,17 +140,18 @@ abstract contract BulgarianTotoLottery is
         if (block.timestamp + BUY_CUTOFF > r.drawTime) revert RefundWindowClosed();
         if (block.timestamp > uint256(t.purchaseTime) + REFUND_WINDOW) revert RefundWindowClosed();
 
-        uint256 price = _ticketPrice(t.game, t.k);
+        uint128 price = t.pricePaid; // refund exactly what was paid
         t.refunded = true;
-        if (availablePool < price) revert PoolUnderflow();
-        availablePool -= price;
-        // Mirror the buyTicket credit: only debit LPs if this specific ticket's purchase
-        // was credited to LPs. Tickets bought when no LPs existed are refunded out of
-        // house surplus and don't touch totalLpAssets.
-        if (t.lpCreditedAtBuy) {
-            // Should never underflow given monotonic refund semantics, but clamp defensively.
-            totalLpAssets = totalLpAssets >= price ? totalLpAssets - price : 0;
+
+        // Reverse the per-game stake credited at buy time.
+        if (t.game == GAME_5_35) {
+            if (r.stake5 < price) revert PoolUnderflow();
+            r.stake5 -= uint128(price);
+        } else {
+            if (r.stake6 < price) revert PoolUnderflow();
+            r.stake6 -= uint128(price);
         }
+
         usdc.safeTransfer(msg.sender, price);
         emit TicketRefunded(ticketId, msg.sender, price);
     }
@@ -146,8 +179,9 @@ abstract contract BulgarianTotoLottery is
     // ============================================================
 
     /// @notice Permissionless: anyone can request the VRF draw once drawTime has passed.
-    /// @dev    Skims TREASURY_BPS from the pool, snapshots the remainder, earmarks the
-    ///         maximum possible payout, and opens the next round atomically.
+    /// @dev    Skims the treasury fee, routes 50% of each game's stakes to that game's
+    ///         lower-tier reserve, adds the remainder to the cumulative pool, snapshots
+    ///         the pool, earmarks the maximum possible jackpot, and opens the next round.
     /// @param roundId The round to draw (must equal currentRoundId).
     /// @return reqId  The Chainlink VRF request ID.
     function requestDraw(uint256 roundId) external nonReentrant returns (uint256 reqId) {
@@ -156,36 +190,39 @@ abstract contract BulgarianTotoLottery is
         if (r.state != uint8(RoundState.Open)) revert WrongRoundState();
         if (block.timestamp < r.drawTime) revert TooEarly();
 
-        // Skim TREASURY_BPS of the pool for the treasury before snapshotting.
-        // LPs absorb the fee pro-rata to their share of availablePool.
-        uint256 availablePoolPreFee = availablePool;
-        uint256 treasuryFee = availablePoolPreFee * TREASURY_BPS / BPS_DENOM;
+        uint256 stake5 = uint256(r.stake5);
+        uint256 stake6 = uint256(r.stake6);
+        uint256 total = stake5 + stake6;
+
+        // 10% treasury fee on the total round stakes.
+        uint256 treasuryFee = total * TREASURY_BPS / BPS_DENOM;
         if (treasuryFee > 0) {
-            availablePool -= treasuryFee;
-            // Pro-rata LP fee debit. availablePoolPreFee > 0 here because treasuryFee > 0.
-            if (totalLpAssets > 0) {
-                uint256 lpFee = treasuryFee * totalLpAssets / availablePoolPreFee;
-                totalLpAssets -= lpFee;
-            }
             usdc.safeTransfer(treasury, treasuryFee);
             emit TreasuryFee(roundId, treasuryFee);
         }
 
-        // Snapshot the pool and earmark the maximum possible payout up-front,
-        // so refunds / new buys for the next round cannot reduce this round's
-        // prize budget while VRF is in flight.
-        uint128 snap = uint128(availablePool);
-        r.snapshotPool = snap;
+        // 50% of each game's stakes is reserved for that game's lower tiers. Computed
+        // per game so the reservation exactly bounds the per-tier budgets at finalize.
+        uint256 lowerReserve =
+            stake5 * LOWER_FUND_BPS / BPS_DENOM + stake6 * LOWER_FUND_BPS / BPS_DENOM;
 
-        // Record the LP-owned slice of the snapshot for proportional slashing at finalize.
-        lpAssetsAtSnap[roundId] = uint128(totalLpAssets);
+        // Everything that is neither fee nor lower reserve flows into the cumulative pool.
+        uint256 poolAdd = total - treasuryFee - lowerReserve;
+        cumulativePool += poolAdd;
 
-        uint256 maxEarmark = uint256(snap) * MAX_PAYOUT_BPS / BPS_DENOM;
-        availablePool -= maxEarmark;
-        earmarkedForRound[roundId] = maxEarmark;
+        // Snapshot the pool (now including this round's contribution) - it sizes the jackpots.
+        uint256 snap = cumulativePool;
+        r.poolSnapshot = uint128(snap);
+
+        // Earmark the maximum possible jackpot (both games hit) out of the pool so a later
+        // round's snapshot cannot double-count money already committed to this round.
+        uint256 jackpotEarmark = snap * MAX_JACKPOT_BPS / BPS_DENOM;
+        cumulativePool -= jackpotEarmark;
+        r.jackpotEarmark = uint128(jackpotEarmark);
+
+        earmarkedForRound[roundId] = lowerReserve + jackpotEarmark;
 
         r.state = uint8(RoundState.AwaitingVRF);
-        unfinalizedRounds++;
 
         VRFV2PlusClient.RandomWordsRequest memory req = VRFV2PlusClient.RandomWordsRequest({
             keyHash: keyHash,
@@ -200,16 +237,22 @@ abstract contract BulgarianTotoLottery is
 
         // Open the next round at the same instant so buyers are never locked out.
         uint256 nextId = roundId + 1;
+
+        // Activate a queued interval change once we reach its activation round. A change
+        // queued at round X activates at round X+2, so the two draws after the admin's
+        // call keep the prior interval and the new spacing only applies thereafter.
+        if (pendingDrawInterval != 0 && nextId >= pendingIntervalActiveRound) {
+            drawInterval = pendingDrawInterval;
+            emit DrawIntervalActivated(nextId, pendingDrawInterval);
+            pendingDrawInterval = 0;
+            pendingIntervalActiveRound = 0;
+        }
+
         Round storage nr = rounds[nextId];
-        nr.drawTime = r.drawTime + uint64(DRAW_INTERVAL);
+        nr.drawTime = r.drawTime + uint64(drawInterval);
         nr.expiryTime = nr.drawTime + uint64(EXPIRY_PERIOD);
         nr.state = uint8(RoundState.Open);
         currentRoundId = nextId;
-
-        // Capture the (assets, shares) snapshot that will price LP withdrawals during
-        // the new round. Refreshed again at _finalizeRound / sweepExpired so that any
-        // settlement of prior rounds is reflected before withdrawals become possible.
-        _snapshotLp(nextId);
 
         emit DrawRequested(roundId, reqId, snap);
         emit RoundOpened(nextId, nr.drawTime);
@@ -283,7 +326,6 @@ abstract contract BulgarianTotoLottery is
         uint8 m = uint8(_popcount(uint256(t.picksMask & drawnMask)));
 
         for (uint8 j = MIN_TIER; j <= R; j++) {
-            if (_tierPct(game, j) == 0) continue;
             uint256 hits = _binom(m, j) * _binom(K - m, R - j);
             if (hits > 0) {
                 tierState[roundId][game][j].totalHits += hits;
@@ -293,56 +335,46 @@ abstract contract BulgarianTotoLottery is
 
     function _finalizeRound(uint256 roundId) internal {
         Round storage r = rounds[roundId];
-        uint256 snap = uint256(r.snapshotPool);
-        uint256 used = 0;
+        uint256 snap = uint256(r.poolSnapshot);
 
-        for (uint8 j = MIN_TIER; j <= DRAW_COUNT_5_35; j++) {
-            uint16 pct = _tierPct(GAME_5_35, j);
-            if (pct == 0) continue;
-            TierState storage ts = tierState[roundId][GAME_5_35][j];
-            if (ts.totalHits == 0) continue;
-            uint256 budget = snap * pct / BPS_DENOM;
-            ts.budget = budget;
-            ts.remaining = budget;
-            used += budget;
-        }
+        uint256 used = _finalizeGame(roundId, GAME_5_35, DRAW_COUNT_5_35, uint256(r.stake5), snap)
+            + _finalizeGame(roundId, GAME_6_49, DRAW_COUNT_6_49, uint256(r.stake6), snap);
 
-        for (uint8 j = MIN_TIER; j <= DRAW_COUNT_6_49; j++) {
-            uint16 pct = _tierPct(GAME_6_49, j);
-            if (pct == 0) continue;
-            TierState storage ts = tierState[roundId][GAME_6_49][j];
-            if (ts.totalHits == 0) continue;
-            uint256 budget = snap * pct / BPS_DENOM;
-            ts.budget = budget;
-            ts.remaining = budget;
-            used += budget;
-        }
-
+        // Anything reserved but not owed to a winner (no-winner tiers, unwon jackpots,
+        // rounding dust) rolls into the cumulative pool.
         uint256 reserved = earmarkedForRound[roundId];
-        if (reserved > used) {
-            availablePool += (reserved - used);
+        uint256 movedToPool = reserved > used ? reserved - used : 0;
+        if (movedToPool > 0) {
+            cumulativePool += movedToPool;
         }
         earmarkedForRound[roundId] = used;
 
-        // Slash LPs proportionally to their share of the snapshot pool.
-        // The non-LP portion of `used` is absorbed by the implicit house surplus
-        // (availablePool - totalLpAssets), which decreases automatically.
-        uint128 lpAtSnap = lpAssetsAtSnap[roundId];
-        if (used > 0 && lpAtSnap > 0 && snap > 0) {
-            uint256 lpLoss = used * uint256(lpAtSnap) / snap;
-            if (lpLoss > totalLpAssets) lpLoss = totalLpAssets; // safety clamp
-            if (lpLoss > 0) {
-                totalLpAssets -= lpLoss;
-                emit LpSlashed(roundId, lpLoss);
-            }
-        }
-
-        if (unfinalizedRounds > 0) unfinalizedRounds--;
-        // Refresh the current round's LP snapshot so withdrawals see the post-slash rate.
-        _snapshotLp(currentRoundId);
-
         r.state = uint8(RoundState.Claimable);
-        emit RoundFinalized(roundId, used);
+        emit RoundFinalized(roundId, used, movedToPool);
+    }
+
+    /// @dev Assign per-tier prize budgets for one game. Lower tiers (j < R) are funded by
+    ///      a fixed share of the game's round stake; the jackpot tier (j == R) is a share
+    ///      of the cumulative pool snapshot. Tiers with no winner are skipped (their funds
+    ///      roll into the pool via the reserved-minus-used delta in _finalizeRound).
+    /// @return used Total budget assigned to tiers that actually have winners.
+    function _finalizeGame(uint256 roundId, uint8 game, uint8 R, uint256 stake, uint256 snap)
+        internal
+        returns (uint256 used)
+    {
+        for (uint8 j = MIN_TIER; j <= R; j++) {
+            uint256 budget = j == R
+                ? snap * uint256(_jackpotBps(game)) / BPS_DENOM
+                : stake * uint256(_lowerBps(game, j)) / BPS_DENOM;
+            if (budget == 0) continue;
+
+            TierState storage ts = tierState[roundId][game][j];
+            if (ts.totalHits == 0) continue; // no winner -> stays in pool
+
+            ts.budget = budget;
+            ts.remaining = budget;
+            used += budget;
+        }
     }
 
     /// @notice Claim a single winning ticket. Pays out to the ticket owner.
@@ -382,7 +414,6 @@ abstract contract BulgarianTotoLottery is
         uint8 m = uint8(_popcount(uint256(t.picksMask & drawnMask)));
 
         for (uint8 j = MIN_TIER; j <= R; j++) {
-            if (_tierPct(game, j) == 0) continue;
             uint256 hits = _binom(m, j) * _binom(K - m, R - j);
             if (hits == 0) continue;
             TierState storage ts = tierState[roundId][game][j];
@@ -400,7 +431,7 @@ abstract contract BulgarianTotoLottery is
         }
     }
 
-    /// @notice After EXPIRY_PERIOD, return any unclaimed prize budget to the pool.
+    /// @notice After EXPIRY_PERIOD, return any unclaimed prize budget to the cumulative pool.
     /// @dev    Sets the round state to Expired so that subsequent claim() calls revert.
     function sweepExpired(uint256 roundId) external nonReentrant {
         Round storage r = rounds[roundId];
@@ -423,39 +454,15 @@ abstract contract BulgarianTotoLottery is
             }
         }
 
-        availablePool += leftover;
+        cumulativePool += leftover;
         if (earmarkedForRound[roundId] >= leftover) {
             earmarkedForRound[roundId] -= leftover;
         } else {
             earmarkedForRound[roundId] = 0;
         }
 
-        // Mirror image of finalize-time slashing: pro-rata credit unclaimed budget back to LPs
-        // using the snapshot ratio captured at requestDraw. Refresh the live LP snapshot so
-        // withdrawals during the current round see the credit.
-        uint128 lpAtSnap = lpAssetsAtSnap[roundId];
-        uint128 snap = r.snapshotPool;
-        if (leftover > 0 && lpAtSnap > 0 && snap > 0) {
-            uint256 lpCredit = leftover * uint256(lpAtSnap) / uint256(snap);
-            if (lpCredit > 0) {
-                totalLpAssets += lpCredit;
-                emit LpCredited(roundId, lpCredit);
-            }
-        }
-        _snapshotLp(currentRoundId);
-
         r.state = uint8(RoundState.Expired);
         emit RoundExpired(roundId, leftover);
-    }
-
-    /// @dev Capture the current LP (assets, shares) for `roundId`. Called at round open
-    ///      from requestDraw, and again at _finalizeRound / sweepExpired so post-settlement
-    ///      changes are reflected before LP withdrawals become possible.
-    function _snapshotLp(uint256 roundId) internal {
-        uint128 a = uint128(totalLpAssets);
-        uint128 s = uint128(totalLpShares);
-        lpSnapshot[roundId] = LpSnapshot({assets: a, shares: s});
-        emit LpSnapshotTaken(roundId, a, s);
     }
 
     // ============================================================
@@ -468,14 +475,12 @@ abstract contract BulgarianTotoLottery is
     ///         without external dependencies. Skips rounds that are AwaitingVRF
     ///         (Chainlink callback required) or already in a final state.
     /// @dev    Uses external self-calls with try/catch so a single failing transition
-    ///         (e.g. VRF subscription empty, drawTime not yet reached) does NOT abort
-    ///         the rest of the batch. Caller may invoke this any number of times;
-    ///         the function is idempotent on rounds that are already up-to-date.
+    ///         does NOT abort the rest of the batch. Idempotent on up-to-date rounds.
     ///
     ///         Per-round actions:
-    ///           Open + drawTime reached    → requestDraw  → AwaitingVRF
-    ///           Tallying                   → tallyBatch   → Tallying or Claimable
-    ///           Claimable + expiryTime past → sweepExpired → Expired
+    ///           Open + drawTime reached     -> requestDraw  -> AwaitingVRF
+    ///           Tallying                    -> tallyBatch   -> Tallying or Claimable
+    ///           Claimable + expiryTime past -> sweepExpired -> Expired
     ///
     /// @param startRoundId    First round to consider (use 0 to scan from genesis).
     /// @param maxRoundsToScan Cap on rounds touched in this call (gas safety).
@@ -500,16 +505,13 @@ abstract contract BulgarianTotoLottery is
 
             if (s == uint8(RoundState.Open)) {
                 // Only the current round is ever Open. Trigger AT MOST ONE requestDraw
-                // per call: cascading draws would burn LINK on empty rounds and stack
-                // unfinalizedRounds, blocking LP withdrawals. Re-invoke after VRF fulfills.
+                // per catchUp call; caller re-invokes after Chainlink VRF fulfills.
                 if (i == cur && block.timestamp >= r.drawTime) {
                     try this.requestDraw(i) returns (uint256) {
                         actionsExecuted++;
-                        // Stop the loop: subsequent rounds (just-opened) should wait
-                        // for the next catchUp call to avoid the cascade.
                         break;
                     } catch {
-                        // VRF subscription empty, paused, etc. — leave for next time.
+                        // VRF subscription empty, paused, etc. - leave for next time.
                     }
                 }
             } else if (s == uint8(RoundState.Tallying)) {
@@ -527,7 +529,7 @@ abstract contract BulgarianTotoLottery is
                     // Defensive.
                 }
             }
-            // AwaitingVRF, Expired, or Claimable-not-yet-expired → silent skip.
+            // AwaitingVRF, Expired, or Claimable-not-yet-expired -> silent skip.
         }
 
         emit CatchUpExecuted(msg.sender, startRoundId, end == 0 ? 0 : end - 1, actionsExecuted);
@@ -552,14 +554,19 @@ abstract contract BulgarianTotoLottery is
         return _roundTickets[roundId][idx];
     }
 
-    /// @notice Look up the price for a given game and pick count.
-    function ticketPrice(uint8 game, uint8 k) external pure returns (uint256) {
+    /// @notice Look up the current price for a given game and pick count.
+    function ticketPrice(uint8 game, uint8 k) external view returns (uint256) {
         return _ticketPrice(game, k);
     }
 
-    /// @notice Look up the prize-pool percentage (in BPS) for a given tier.
-    function tierPct(uint8 game, uint8 tier) external pure returns (uint16) {
-        return _tierPct(game, tier);
+    /// @notice Lower-tier share in BPS of that game's round stake (0 for the jackpot tier).
+    function lowerTierBps(uint8 game, uint8 tier) external pure returns (uint16) {
+        return _lowerBps(game, tier);
+    }
+
+    /// @notice Jackpot share in BPS of the cumulative pool snapshot for a game.
+    function jackpotBps(uint8 game) external pure returns (uint16) {
+        return _jackpotBps(game);
     }
 
     /// @notice Compute the payout a ticket would receive if claim() were called now.
@@ -574,7 +581,6 @@ abstract contract BulgarianTotoLottery is
         uint8 m = uint8(_popcount(uint256(t.picksMask & drawnMask)));
 
         for (uint8 j = MIN_TIER; j <= R; j++) {
-            if (_tierPct(t.game, j) == 0) continue;
             uint256 hits = _binom(m, j) * _binom(t.k - m, R - j);
             if (hits == 0) continue;
             TierState memory ts = tierState[t.roundId][t.game][j];
@@ -605,7 +611,9 @@ abstract contract BulgarianTotoLottery is
         Round memory r = rounds[roundId];
         info.drawTime = r.drawTime;
         info.expiryTime = r.expiryTime;
-        info.snapshotPool = r.snapshotPool;
+        info.stake5 = r.stake5;
+        info.stake6 = r.stake6;
+        info.poolSnapshot = r.poolSnapshot;
         info.state = RoundState(r.state);
         info.drawn5 = _maskToNumbers(r.drawnMask5, MAX_NUM_5_35);
         info.drawn6 = _maskToNumbers(r.drawnMask6, MAX_NUM_6_49);
@@ -622,7 +630,8 @@ abstract contract BulgarianTotoLottery is
     }
 
     /// @notice Return tier-level prize data for both games in a round.
-    /// @dev    Arrays are indexed 0 = tier 3, 1 = tier 4, etc.
+    /// @dev    Arrays are indexed 0 = tier 3, 1 = tier 4, etc. The last element of each
+    ///         array is the jackpot tier (tier 5 for 5/35, tier 6 for 6/49).
     function getRoundTiers(uint256 roundId)
         external
         view
@@ -737,33 +746,38 @@ abstract contract BulgarianTotoLottery is
         return num / den;
     }
 
-    /// @dev Return the USDC price for a ticket with the given game and pick count.
-    function _ticketPrice(uint8 game, uint8 k) internal pure returns (uint256) {
+    /// @dev Return the current USDC price for a ticket with the given game and pick count.
+    ///      Prices are admin-settable (see setTicketPrice); this reads the live values.
+    function _ticketPrice(uint8 game, uint8 k) internal view returns (uint256) {
         if (game == GAME_5_35) {
-            if (k == 5) return PRICE_5_35_BASE;
-            if (k == 6) return PRICE_5_35_PLUS1;
-            if (k == 7) return PRICE_5_35_PLUS2;
+            if (k == 5) return price535_k5;
+            if (k == 6) return price535_k6;
+            if (k == 7) return price535_k7;
         } else if (game == GAME_6_49) {
-            if (k == 6) return PRICE_6_49_BASE;
-            if (k == 7) return PRICE_6_49_PLUS1;
-            if (k == 8) return PRICE_6_49_PLUS2;
+            if (k == 6) return price649_k6;
+            if (k == 7) return price649_k7;
+            if (k == 8) return price649_k8;
         }
         revert InvalidPickCount();
     }
 
-    /// @dev Return the prize-pool BPS for a given game and tier (0 if tier is invalid).
-    function _tierPct(uint8 game, uint8 tier) internal pure returns (uint16) {
+    /// @dev Lower-tier BPS (of the game's round stake). Returns 0 for the jackpot tier
+    ///      and any invalid tier.
+    function _lowerBps(uint8 game, uint8 tier) internal pure returns (uint16) {
         if (game == GAME_5_35) {
-            if (tier == 5) return PCT_5_35_TIER5;
-            if (tier == 4) return PCT_5_35_TIER4;
-            if (tier == 3) return PCT_5_35_TIER3;
+            if (tier == 4) return LBPS_5_35_TIER4;
+            if (tier == 3) return LBPS_5_35_TIER3;
             return 0;
         } else {
-            if (tier == 6) return PCT_6_49_TIER6;
-            if (tier == 5) return PCT_6_49_TIER5;
-            if (tier == 4) return PCT_6_49_TIER4;
-            if (tier == 3) return PCT_6_49_TIER3;
+            if (tier == 5) return LBPS_6_49_TIER5;
+            if (tier == 4) return LBPS_6_49_TIER4;
+            if (tier == 3) return LBPS_6_49_TIER3;
             return 0;
         }
+    }
+
+    /// @dev Jackpot BPS (of the cumulative pool snapshot) for a game.
+    function _jackpotBps(uint8 game) internal pure returns (uint16) {
+        return game == GAME_5_35 ? JACKPOT_BPS_5_35 : JACKPOT_BPS_6_49;
     }
 }
