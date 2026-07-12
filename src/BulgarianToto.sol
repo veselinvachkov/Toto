@@ -36,6 +36,7 @@ contract BulgarianToto is BulgarianTotoLottery {
         address _treasury
     ) VRFConsumerBaseV2Plus(_vrfCoordinator) BulgarianTotoStorage(_usdc) {
         if (_treasury == address(0)) revert ZeroAddress();
+        if (_callbackGasLimit < MIN_CALLBACK_GAS_LIMIT) revert CallbackGasLimitTooLow();
         treasury = _treasury;
         keyHash = _keyHash;
         subId = _subId;
@@ -139,13 +140,16 @@ contract BulgarianToto is BulgarianTotoLottery {
     /// @param _keyHash          The VRF key hash.
     /// @param _subId            The VRF subscription ID.
     /// @param _confirmations    Number of block confirmations before VRF responds.
-    /// @param _callbackGasLimit Gas limit for the VRF callback.
+    /// @param _callbackGasLimit Gas limit for the VRF callback; must be at least
+    ///        MIN_CALLBACK_GAS_LIMIT so fulfillRandomWords can never run out of gas
+    ///        and strand a round in AwaitingVRF.
     function setVrfConfig(
         bytes32 _keyHash,
         uint256 _subId,
         uint16 _confirmations,
         uint32 _callbackGasLimit
     ) external onlyOwner {
+        if (_callbackGasLimit < MIN_CALLBACK_GAS_LIMIT) revert CallbackGasLimitTooLow();
         keyHash = _keyHash;
         subId = _subId;
         requestConfirmations = _confirmations;

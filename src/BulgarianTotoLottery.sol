@@ -224,16 +224,7 @@ abstract contract BulgarianTotoLottery is
 
         r.state = uint8(RoundState.AwaitingVRF);
 
-        VRFV2PlusClient.RandomWordsRequest memory req = VRFV2PlusClient.RandomWordsRequest({
-            keyHash: keyHash,
-            subId: subId,
-            requestConfirmations: requestConfirmations,
-            callbackGasLimit: callbackGasLimit,
-            numWords: 2,
-            extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
-        });
-        reqId = s_vrfCoordinator.requestRandomWords(req);
-        vrfRequestToRound[reqId] = roundId;
+        reqId = _issueVrfRequest(roundId);
 
         // Open the next round at the same instant so buyers are never locked out.
         uint256 nextId = roundId + 1;
@@ -258,6 +249,49 @@ abstract contract BulgarianTotoLottery is
         emit RoundOpened(nextId, nr.drawTime);
     }
 
+    /// @notice Re-issue the VRF request for a round stuck in AwaitingVRF.
+    /// @dev    Permissionless, but only after the round's current request has been
+    ///         pending for VRF_RETRY_TIMEOUT. Recovery flow for a stuck draw:
+    ///           1. the owner fixes the root cause - refill the subscription with
+    ///              LINK, raise callbackGasLimit / swap subId via setVrfConfig, or
+    ///              swap the coordinator via setCoordinator;
+    ///           2. anyone calls retryDraw (catchUp also does this automatically).
+    ///         The superseded request is invalidated: fulfillRandomWords only accepts
+    ///         the round's CURRENT request id, so if the old request fulfills late it
+    ///         is ignored and cannot race the retry.
+    /// @param roundId The stuck round.
+    /// @return reqId  The new Chainlink VRF request ID.
+    function retryDraw(uint256 roundId) external nonReentrant returns (uint256 reqId) {
+        Round storage r = rounds[roundId];
+        if (r.state != uint8(RoundState.AwaitingVRF)) revert WrongRoundState();
+        if (block.timestamp < uint256(vrfRequestedAt[roundId]) + VRF_RETRY_TIMEOUT) {
+            revert TooEarly();
+        }
+
+        uint256 oldReqId = roundVrfRequest[roundId];
+        delete vrfRequestToRound[oldReqId];
+
+        reqId = _issueVrfRequest(roundId);
+        emit DrawRetried(roundId, oldReqId, reqId);
+    }
+
+    /// @dev Issue a VRF request for a round using the current VRF config and record
+    ///      it as the round's single accepted pending request.
+    function _issueVrfRequest(uint256 roundId) internal returns (uint256 reqId) {
+        VRFV2PlusClient.RandomWordsRequest memory req = VRFV2PlusClient.RandomWordsRequest({
+            keyHash: keyHash,
+            subId: subId,
+            requestConfirmations: requestConfirmations,
+            callbackGasLimit: callbackGasLimit,
+            numWords: 2,
+            extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
+        });
+        reqId = s_vrfCoordinator.requestRandomWords(req);
+        vrfRequestToRound[reqId] = roundId;
+        roundVrfRequest[roundId] = reqId;
+        vrfRequestedAt[roundId] = uint64(block.timestamp);
+    }
+
     /// @notice Chainlink VRF callback - stores drawn numbers and moves to Tallying.
     /// @dev    If a round has zero tickets, finalization happens immediately.
     function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords)
@@ -268,6 +302,9 @@ abstract contract BulgarianTotoLottery is
         Round storage r = rounds[roundId];
         if (r.state != uint8(RoundState.AwaitingVRF)) {
             return; // defensive: ignore stale / unknown
+        }
+        if (roundVrfRequest[roundId] != requestId) {
+            return; // superseded by retryDraw: only the current request may fulfill
         }
         delete vrfRequestToRound[requestId];
 
@@ -472,13 +509,15 @@ abstract contract BulgarianTotoLottery is
     /// @notice Single-call permissionless catch-up. Walks the round range
     ///         [startRoundId .. min(startRoundId + maxRoundsToScan - 1, currentRoundId)]
     ///         and advances each round through the state machine as far as possible
-    ///         without external dependencies. Skips rounds that are AwaitingVRF
-    ///         (Chainlink callback required) or already in a final state.
+    ///         without external dependencies. Rounds that are AwaitingVRF are skipped
+    ///         (Chainlink callback required) unless their request has been pending for
+    ///         VRF_RETRY_TIMEOUT, in which case a retryDraw is attempted.
     /// @dev    Uses external self-calls with try/catch so a single failing transition
     ///         does NOT abort the rest of the batch. Idempotent on up-to-date rounds.
     ///
     ///         Per-round actions:
     ///           Open + drawTime reached     -> requestDraw  -> AwaitingVRF
+    ///           AwaitingVRF + retry timeout -> retryDraw    -> AwaitingVRF (new request)
     ///           Tallying                    -> tallyBatch   -> Tallying or Claimable
     ///           Claimable + expiryTime past -> sweepExpired -> Expired
     ///
@@ -514,6 +553,15 @@ abstract contract BulgarianTotoLottery is
                         // VRF subscription empty, paused, etc. - leave for next time.
                     }
                 }
+            } else if (s == uint8(RoundState.AwaitingVRF)) {
+                // Stuck draw: re-issue the VRF request once the retry timeout passes.
+                if (block.timestamp >= uint256(vrfRequestedAt[i]) + VRF_RETRY_TIMEOUT) {
+                    try this.retryDraw(i) returns (uint256) {
+                        actionsExecuted++;
+                    } catch {
+                        // Coordinator/subscription still broken - leave for next time.
+                    }
+                }
             } else if (s == uint8(RoundState.Tallying)) {
                 try this.tallyBatch(i, tallyBatchSize) returns (bool) {
                     actionsExecuted++;
@@ -529,7 +577,7 @@ abstract contract BulgarianTotoLottery is
                     // Defensive.
                 }
             }
-            // AwaitingVRF, Expired, or Claimable-not-yet-expired -> silent skip.
+            // AwaitingVRF-not-yet-retryable, Expired, or Claimable-not-yet-expired -> skip.
         }
 
         emit CatchUpExecuted(msg.sender, startRoundId, end == 0 ? 0 : end - 1, actionsExecuted);

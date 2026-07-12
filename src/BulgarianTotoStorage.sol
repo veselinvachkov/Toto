@@ -151,6 +151,16 @@ abstract contract BulgarianTotoStorage {
 
     uint16 public constant TREASURY_BPS = 1000; // 10.0% of round stakes
 
+    /// @notice How long a round must sit in AwaitingVRF before anyone may re-issue
+    ///         the VRF request via retryDraw(). Chainlink normally fulfills within
+    ///         minutes; a request older than this is considered stuck.
+    uint256 public constant VRF_RETRY_TIMEOUT = 2 hours;
+    /// @notice Lower bound for the VRF callback gas limit. fulfillRandomWords must be
+    ///         able to store both draw masks AND run the zero-ticket _finalizeRound
+    ///         path; a callback that reverts on out-of-gas is never retried by
+    ///         Chainlink and would otherwise strand the round in AwaitingVRF.
+    uint32 public constant MIN_CALLBACK_GAS_LIMIT = 400_000;
+
     // ============================================================
     // STATE
     // ============================================================
@@ -212,6 +222,13 @@ abstract contract BulgarianTotoStorage {
     uint256 public price649_k7; // 6/49, K=7
     uint256 public price649_k8; // 6/49, K=8
 
+    // --- Stuck-draw recovery (see retryDraw) ---
+    // The round's CURRENT pending VRF request. fulfillRandomWords only accepts this
+    // request id, so a request superseded by retryDraw can never fulfill the round.
+    mapping(uint256 => uint256) public roundVrfRequest;
+    // When the round's current VRF request was issued; gates the retry timeout.
+    mapping(uint256 => uint64) public vrfRequestedAt;
+
     // ============================================================
     // EVENTS
     // ============================================================
@@ -231,6 +248,8 @@ abstract contract BulgarianTotoStorage {
     /// @notice Emitted when the owner reclaims part of their own donations to the treasury.
     event OwnerDonationReclaimed(uint256 amount, address indexed treasury, uint256 remaining);
     event DrawRequested(uint256 indexed roundId, uint256 vrfRequestId, uint256 poolSnapshot);
+    /// @notice Emitted when a stuck AwaitingVRF round gets a fresh VRF request.
+    event DrawRetried(uint256 indexed roundId, uint256 oldRequestId, uint256 newRequestId);
     event DrawFulfilled(uint256 indexed roundId, uint64 mask5, uint64 mask6);
     event TallyAdvanced(uint256 indexed roundId, uint64 cursor, uint64 totalTickets);
     event RoundFinalized(uint256 indexed roundId, uint256 totalPrizeBudget, uint256 movedToPool);
@@ -274,6 +293,7 @@ abstract contract BulgarianTotoStorage {
     error IntervalOutOfRange();
     error InsufficientOwnerDonations();
     error InvalidPrice();
+    error CallbackGasLimitTooLow();
 
     /// @dev Constructor only sets the immutable `usdc`. All other state is initialized
     ///      by the concrete child's constructor.

@@ -7,10 +7,11 @@ import {
   Network,
 } from 'ethers';
 import { useConnectorClient } from 'wagmi';
+import { CHAIN_ID } from '../config/wagmi';
 
-const SEPOLIA = Network.from(11155111);
+const NETWORK = Network.from(CHAIN_ID);
 
-// Several Sepolia endpoints behind a FallbackProvider (quorum 1): each request
+// Several public endpoints behind a FallbackProvider (quorum 1): each request
 // goes to the highest-priority endpoint and transparently fails over to the
 // next on error/stall, so one throttled node never blanks the page.
 // `staticNetwork` also drops the per-request eth_chainId round-trip.
@@ -18,13 +19,21 @@ const SEPOLIA = Network.from(11155111);
 // SCALE: public RPCs rate-limit hard (HTTP 429) and will not survive tens of
 // thousands of concurrent readers. Point `VITE_RPC_URLS` (comma-separated) at a
 // dedicated provider (Alchemy/Infura/QuickNode) or your own proxy in
-// production. The public list below is only a development / fallback default.
-const PUBLIC_RPC_URLS = [
-  'https://ethereum-sepolia-rpc.publicnode.com',
-  'https://sepolia.drpc.org',
-  'https://1rpc.io/sepolia',
-  'https://rpc.sepolia.org',
-];
+// production. The public lists below are only development / fallback defaults.
+const PUBLIC_RPC_URLS =
+  CHAIN_ID === 1
+    ? [
+        'https://ethereum-rpc.publicnode.com',
+        'https://eth.drpc.org',
+        'https://1rpc.io/eth',
+        'https://eth.llamarpc.com',
+      ]
+    : [
+        'https://ethereum-sepolia-rpc.publicnode.com',
+        'https://sepolia.drpc.org',
+        'https://1rpc.io/sepolia',
+        'https://rpc.sepolia.org',
+      ];
 
 const RPC_URLS = (() => {
   const fromEnv = (import.meta.env.VITE_RPC_URLS as string | undefined)
@@ -37,12 +46,12 @@ const RPC_URLS = (() => {
 /** Public read-only provider (no wallet required). */
 export const readProvider = new FallbackProvider(
   RPC_URLS.map((url, i) => ({
-    provider: new JsonRpcProvider(url, SEPOLIA, { staticNetwork: SEPOLIA }),
+    provider: new JsonRpcProvider(url, NETWORK, { staticNetwork: NETWORK }),
     priority: i + 1, // try publicnode first, fail over down the list
     stallTimeout: 2500,
     weight: 1,
   })),
-  SEPOLIA,
+  NETWORK,
   { quorum: 1 },
 );
 

@@ -789,7 +789,7 @@ contract BulgarianTotoTest is Test {
         vm.prank(alice);
         toto.transferTicket(id, bob);
 
-        (address newOwner,,,,,,,) = toto.tickets(id);
+        (address newOwner,,,,,,,,) = toto.tickets(id);
         assertEq(newOwner, bob);
     }
 
