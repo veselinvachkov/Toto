@@ -16,6 +16,12 @@ const NETWORK = Network.from(CHAIN_ID);
 // next on error/stall, so one throttled node never blanks the page.
 // `staticNetwork` also drops the per-request eth_chainId round-trip.
 //
+// CAVEAT: with quorum 1 a fast JSON-RPC *error* response can win the race and
+// be returned without consulting the other endpoints (publicnode now rejects
+// eth_getLogs with "archive token required", which blanked the leaderboard).
+// Historical log scans therefore go through utils/logScan.ts, which iterates
+// endpoints explicitly instead of relying on this provider.
+//
 // SCALE: public RPCs rate-limit hard (HTTP 429) and will not survive tens of
 // thousands of concurrent readers. Point `VITE_RPC_URLS` (comma-separated) at a
 // dedicated provider (Alchemy/Infura/QuickNode) or your own proxy in
@@ -32,10 +38,11 @@ const PUBLIC_RPC_URLS =
         'https://ethereum-sepolia-rpc.publicnode.com',
         'https://sepolia.drpc.org',
         'https://1rpc.io/sepolia',
-        'https://rpc.sepolia.org',
+        // rpc.sepolia.org went dark (HTML 404) — replaced with Tenderly's gateway.
+        'https://sepolia.gateway.tenderly.co',
       ];
 
-const RPC_URLS = (() => {
+export const RPC_URLS = (() => {
   const fromEnv = (import.meta.env.VITE_RPC_URLS as string | undefined)
     ?.split(',')
     .map((u) => u.trim())

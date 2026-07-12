@@ -5,8 +5,9 @@ import { usePolling } from '../hooks/usePolling';
 import { CONTRACT_ADDRESS, DEPLOY_BLOCK } from '../config/contract';
 import { loadCache, saveCache } from '../utils/persist';
 import { fmtUsdc } from '../utils/format';
+import { queryFilterFailover } from '../utils/logScan';
 
-// Public RPCs cap `eth_getLogs` block ranges (publicnode ~10k). Query the
+// Public RPCs cap `eth_getLogs` block ranges (drpc freetier 10k). Query the
 // Claimed history in chunks starting from the deploy block instead of genesis.
 const LOG_CHUNK = 9_000;
 
@@ -40,6 +41,11 @@ const cache: LbCache = (() => {
 })();
 let inflight: Promise<void> | null = null;
 
+// True when the last scan attempt could NOT reach the chain head (RPC errors),
+// so an empty board means "couldn't load", not "no wins yet". Module-level so
+// remounts keep the honest state.
+let scanIncomplete = false;
+
 // Collapse by (owner, amount) so one winner who claims many identical tickets
 // fills a single slot, then keep only the largest TOP_KEEP. Bounded by design.
 function mergeTop(existing: Entry[], incoming: Entry[]): Entry[] {
@@ -55,6 +61,7 @@ export default function Leaderboard() {
   const toto = useTotoRead();
   const [entries, setEntries] = useState<Entry[]>(() => cache.top.slice(0, 5));
   const [loading, setLoading] = useState(cache.top.length === 0);
+  const [failed, setFailed] = useState(false);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -67,6 +74,7 @@ export default function Leaderboard() {
       if (mounted.current) {
         setEntries(cache.top.slice(0, 5));
         setLoading(false);
+        setFailed(scanIncomplete && cache.top.length === 0);
       }
     };
 
@@ -76,7 +84,7 @@ export default function Leaderboard() {
     inflight = (async () => {
       try {
         const latest = await readProvider.getBlockNumber();
-        if (latest <= cache.scannedTo) return;
+        if (latest <= cache.scannedTo) { scanIncomplete = false; return; }
 
         const from = cache.scannedTo + 1;
         const filter = toto.filters.Claimed();
@@ -97,7 +105,7 @@ export default function Leaderboard() {
             const i = next++;
             if (i >= windows.length) return;
             try {
-              const logs = await toto.queryFilter(filter, windows[i].f, windows[i].t);
+              const logs = await queryFilterFailover(toto, filter, windows[i].f, windows[i].t);
               const fresh: Entry[] = (logs as any[]).map((log) => ({
                 ticketId: log.args[0].toString(),
                 owner: log.args[1] as string,
@@ -116,8 +124,9 @@ export default function Leaderboard() {
         let prefix = 0;
         while (prefix < windows.length && ok[prefix]) prefix++;
         if (prefix > 0) cache.scannedTo = windows[prefix - 1].t;
+        scanIncomplete = cache.scannedTo < latest;
         saveCache(STORAGE_KEY, cache);
-      } catch { /* keep previously loaded entries */ }
+      } catch { scanIncomplete = true; /* keep previously loaded entries */ }
     })();
 
     try { await inflight; } finally { inflight = null; }
@@ -159,7 +168,13 @@ export default function Leaderboard() {
 
       {loading && <p className="muted" style={{ fontSize: '0.85rem' }}>Loading...</p>}
 
-      {!loading && entries.length === 0 && (
+      {!loading && entries.length === 0 && failed && (
+        <p className="muted" style={{ fontSize: '0.85rem' }}>
+          Couldn&apos;t load win history — retrying shortly
+        </p>
+      )}
+
+      {!loading && entries.length === 0 && !failed && (
         <p className="muted" style={{ fontSize: '0.85rem' }}>No wins yet</p>
       )}
 

@@ -8,14 +8,15 @@ import { multicall } from '../hooks/multicall';
 import { formatError } from '../utils/errors';
 import { fmtUsdc } from '../utils/format';
 import { loadCache, saveCache } from '../utils/persist';
+import { queryFilterFailover } from '../utils/logScan';
 import LotteryBall from '../components/LotteryBall';
 import { drawWinCard, canvasToBlob, type WinCardData } from '../utils/winCard';
 
 const STATE_LABELS = ['Open', 'Drawing', 'Tallying', 'Claimable', 'Expired'];
 const STATE_BADGE  = ['badge-open', 'badge-awaiting', 'badge-tallying', 'badge-claimable', 'badge-expired'];
 
-// Public RPCs cap `eth_getLogs` block ranges (publicnode ~10k). Scan the user's
-// Claimed history in chunks starting from the deploy block.
+// Public RPCs cap `eth_getLogs` block ranges (drpc freetier 10k). Scan the
+// user's Claimed history in chunks starting from the deploy block.
 const LOG_CHUNK = 9_000;
 
 /** Lightweight ticket data fetched for every ticket up front (cheap calls). */
@@ -234,7 +235,7 @@ export default function MyTickets() {
           const i = next++;
           if (i >= windows.length) return;
           try {
-            const logs = await toto.queryFilter(filter, windows[i].f, windows[i].t);
+            const logs = await queryFilterFailover(toto, filter, windows[i].f, windows[i].t);
             for (const log of logs as any[]) {
               amounts[Number(log.args[0])] = formatUnits(log.args[2], 6);
             }
